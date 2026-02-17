@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+from collections import Counter
 import csv
+import datetime
 import json
 import math
-from collections import Counter
 import os
 import re
 import statistics
@@ -32,6 +33,7 @@ COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
 METRICS_FILENAME = "podLatencyMeasurement-rds.json"
 SUMMARY_FILENAME = "jobSummary.json"
 OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
+DEFAULT_VAL = "-"
 
 
 # --- 2. HELPER FUNCTIONS ---
@@ -73,16 +75,45 @@ def find_pairs_recursively(fragments):
                     })
     return pairs
 
-def print_visuals(lats, frag):
-    if not plotille or not lats:
+def print_visuals(metrics_list, frag):
+    if not plotille or not isinstance(metrics_list, list):
         return
+
+    sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
+    if not sorted_lats: return
+
+    print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {frag} " + "="*25 + "\033[0m")
+
+    # --- 1. Scatterplot (Chronological Progress) ---
+    data_points = []
+    for i in metrics_list:
+        if 'timestamp' in i and 'schedulingLatency' in i:
+            try:
+                ts = datetime.datetime.fromisoformat(i['timestamp'].replace('Z', '+00:00'))
+                data_points.append((ts, i['schedulingLatency']))
+            except: continue
+
+    if data_points:
+        data_points.sort(key=lambda x: x[0])
+        start_t = data_points[0][0]
+        x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
+        y_lats = [p[1] for p in data_points]
+        print(f"\n[ Latency Scatterplot (Time vs. Delay) ]")
+        latency_scatter = plotille.Figure()
+        latency_scatter.set_x_limits(min_=0)
+        latency_scatter.width, latency_scatter.height = 70, 12
+        latency_scatter.scatter(x_secs, y_lats, lc='cyan')
+        print(latency_scatter.show())
+
+    # --- 2. Snap-to-Grid Histogram ---
+
     # 1. Determine Step
-    lats_min, lats_max = min(lats), max(lats)
+    lats_min, lats_max = min(sorted_lats), max(sorted_lats)
     step = get_pretty_step(lats_max - lats_min)
 
     # 2. SNAP DATA TO GRID
     # We transform the data into bucket labels (e.g., 2000, 4000, 6000)
-    snapped_data = [math.floor(x / step) * step for x in lats]
+    snapped_data = [math.floor(x / step) * step for x in sorted_lats]
     counts = Counter(snapped_data)
 
     # 3. Build a sorted list of buckets to display
@@ -90,13 +121,9 @@ def print_visuals(lats, frag):
     start_bucket = math.floor(lats_min / step) * step
     end_bucket = math.floor(lats_max / step) * step
 
-    print(f"\n\033[1;34m" + "="*20 + f" VISUALS FOR {frag} " + "="*20 + "\033[0m")
-    print(f"\n[ Frequency Histogram ({step/1000:g}s Exact Buckets) ]")
-    print(f"{'Bucket Range (ms)':<20} | {'Chart':<45} | Count")
-    print("-" * 75)
-
+    print(f"\n[ Frequency Histogram ({step/1000:g}s Buckets) ]")
+    print(f"{'Bucket Range (ms)':<18} | {'Chart':<40} | Count")
     max_count = max(counts.values()) if counts else 1
-
     curr = start_bucket
     while curr <= end_bucket:
         cnt = counts.get(curr, 0)
@@ -104,20 +131,20 @@ def print_visuals(lats, frag):
         bar_len = int((cnt / max_count) * 40) if max_count > 0 else 0
         bar = "⣿" * bar_len
 
-        print(f"[{curr:<7}, {curr+step:<7}) | {bar:<45} | {cnt}")
+        print(f"[{curr:<7}, {curr+step:<7}) | {bar:<40} | {cnt}")
         curr += step
 
+    # --- 3. CDF Line ---
     print("\n[ Cumulative Distribution (CDF) ]")
-    sorted_lats = sorted(lats)
     n = len(sorted_lats)
     y_vals = [i / n for i in range(n)]
-    fig = plotille.Figure()
-    fig.width, fig.height = 70, 15
-    fig.plot(sorted_lats, y_vals)
-    print(fig.show())
+    cdf = plotille.Figure()
+    cdf.set_x_limits(min_=0)
+    cdf.set_y_limits(min_=0,max_=1)
+    cdf.width, cdf.height = 70, 12
+    cdf.plot(sorted_lats, y_vals)
+    print(cdf.show())
     print("\033[1;34m" + "="*70 + "\033[0m\n")
-
-# --- 3. MAIN PROCESSING ---
 
 def process_automation():
     uuid_fragments = sys.argv[1:]
@@ -133,16 +160,15 @@ def process_automation():
     results = []
 
     for pair in discovered_pairs:
-        frag = pair['fragment']
-        data = {'uuid_fragment': frag}
+        data = {'uuid_fragment': pair['fragment']}
 
-        # A. Log Processing
+        # Log Logic
         try:
             with open(pair['log_path'], 'r') as f:
                 lines = f.readlines()
                 if lines:
-                    data['start time'] = parse_logfmt_line(lines[0]).get('time', 'N/A')
-                    data['end time'] = parse_logfmt_line(lines[-1]).get('time', 'N/A')
+                    data['start time'] = parse_logfmt_line(lines[0]).get('time', DEFAULT_VAL)
+                    data['end time'] = parse_logfmt_line(lines[-1]).get('time', DEFAULT_VAL)
                     for line in lines:
                         parsed = parse_logfmt_line(line)
                         msg = parsed.get('msg', '')
@@ -166,76 +192,63 @@ def process_automation():
             with open(summary_path, 'r') as f:
                 summary_data = json.load(f)[0]
                 data.update({
-                    'OCP Version': summary_data.get('ocpVersion', 'N/A'),
-                    'scheduler': summary_data.get('scheduler', 'N/A'),
-                    'podReplicas': summary_data.get('podReplicas', 0),
+                    'OCP Version': summary_data.get('ocpVersion', DEFAULT_VAL),
+                    'scheduler': summary_data.get('scheduler', DEFAULT_VAL),
+                    'podReplicas': summary_data.get('podReplicas', DEFAULT_VAL),
                     'workers': summary_data.get('otherNodesCount', 0)
                 })
                 job_cfg = summary_data.get('jobConfig', {})
-                data['workload'] = job_cfg.get('name', 'N/A')
+                data['workload'] = job_cfg.get('name', DEFAULT_VAL)
                 data['iterations'] = job_cfg.get('jobIterations', 0)
                 churn = job_cfg.get('churnConfig', {})
                 data.update({
-                    'cycles': churn.get('cycles', 0),
-                    'percent': churn.get('percent', 0),
+                    'cycles': churn.get('cycles', DEFAULT_VAL),
+                    'percent': churn.get('percent', DEFAULT_VAL),
                     'duration': f"{int(churn.get('duration', 0) / 60_000_000_000)}m"
                 })
         except Exception as e: print(f"  [!] Summary JSON Error: {e}")
 
         lat_path = os.path.join(pair['metrics_dir'], METRICS_FILENAME)
+
         try:
             with open(lat_path, 'r') as f:
                 m_list = json.load(f)
-                lats = [i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i]
-                if lats:
-                    print_visuals(lats, frag)
-                    data['stddev'] = round(statistics.stdev(lats), 2) if len(lats) > 1 else 0
+                if isinstance(m_list, list):
+                    lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
+                    print_visuals(m_list, pair['fragment'])
+                    data['stddev'] = round(statistics.stdev(lats), 2)
                     data['Spread'] = max(lats) - min(lats)
-                    avg_val = sum(lats)/len(lats)
-                    data['CV'] = round((data['stddev'] / avg_val), 3) if avg_val > 0 else 0
+                    data['avg'] = round(statistics.mean(lats), 2)
+                    data['max'] = max(lats)
+                    data['CV'] = round(data['stddev'] / data['avg'], 3)
+                    data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
                     dist = statistics.quantiles(lats, n=20)
                     for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
-        # Compile row according to final COLUMN_ORDER
-        results.append({col: data.get(col, 'N/A') for col in COLUMN_ORDER + ['Spread', 'CV']})
+        results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
 
-    # --- 4. SUMMARY & CSV EXPORT ---
+    # Summary Table
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
-    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Spread':<10} | {'Consistency (CV)':<15}")
-    print("-" * 110)
-
+    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Consistency (CV)':<15}")
+    print("-" * 85)
     for r in results:
-        avg = r.get('avg', 0)
-        cv = r.get('CV')
-        replicas = r.get('podReplicas', 'N/A')
+        cv = r.get('CV', 0)
+        status = "✅ Stable" if (isinstance(cv, float) and cv < 0.2) else "❌ High Var"
+        print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {cv:<15} {status}")
 
-        if isinstance(cv, (int, float)):
-            status = "✅ Stable" if cv < 0.2 else "⚠️ Noisy" if cv < 0.5 else "❌ High Variance"
-            cv_disp = f"{cv:<15.3f}"
-        else:
-            status = "❔ Missing Data"
-            cv_disp = f"{'N/A':<15}"
-
-        label = r['UUID'][:8] if r.get('UUID') != 'N/A' else r.get('uuid_fragment', 'Unknown')
-        print(f"{label:<12} | {r['scheduler']:<15} | {replicas:<10} | {avg:<10} | {r.get('Spread', 'N/A'):<10} | {cv_disp} {status}")
-
-    # Save to file
+    # CSV Dump
     with open(OUTPUT_FILE, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(results)
 
     # Write to Standard Out (Console)
-    print(f"\n--- CSV DATA START ---")
+    print("\n" + "="*30 + " CSV RAW DATA " + "="*30)
     # We use sys.stdout as the 'file' for the writer
     console_writer = csv.DictWriter(sys.stdout, fieldnames=COLUMN_ORDER, extrasaction='ignore')
     console_writer.writeheader()
     console_writer.writerows(results)
-    print(f"--- CSV DATA END ---\n")
-
-
-    print(f"Report saved: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     process_automation()
