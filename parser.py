@@ -75,14 +75,14 @@ def find_pairs_recursively(fragments):
                     })
     return pairs
 
-def print_visuals(metrics_list, frag):
+def print_visuals(metrics_list, frag, scheduler):
     if not plotille or not isinstance(metrics_list, list):
         return
 
     sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
     if not sorted_lats: return
 
-    print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {frag} " + "="*25 + "\033[0m")
+    print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
 
     # --- 1. Scatterplot (Chronological Progress) ---
     data_points = []
@@ -215,7 +215,7 @@ def process_automation():
                 m_list = json.load(f)
                 if isinstance(m_list, list):
                     lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
-                    print_visuals(m_list, pair['fragment'])
+                    print_visuals(m_list, pair['fragment'], data['scheduler'])
                     data['stddev'] = round(statistics.stdev(lats), 2)
                     data['Spread'] = max(lats) - min(lats)
                     data['avg'] = round(statistics.mean(lats), 2)
