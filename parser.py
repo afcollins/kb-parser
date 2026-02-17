@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-import json
 import csv
-import re
+import json
+import math
 import os
-import sys
+import re
 import statistics
+import sys
 
 # Attempt to import plotille for terminal visuals
 try:
@@ -66,8 +67,23 @@ def print_visuals(lats, frag):
     if not plotille or not lats:
         return
     print(f"\n\033[1;34m" + "="*20 + f" VISUALS FOR {frag} " + "="*20 + "\033[0m")
-    print("\n[ Frequency Histogram ]")
-    print(plotille.hist(lats, bins=20, width=70))
+    # --- Clean Histogram Logic ---
+    print("\n[ Frequency Histogram (Exact 1000ms Buckets) ]")
+
+    # 1. Manually calculate boundaries to ensure they are even 1000s
+    lower_bound = math.floor(min(lats) / 1000) * 1000
+    upper_bound = math.ceil(max(lats) / 1000) * 1000
+
+    # 2. Determine number of bins (1 per 1000ms)
+    # We cap this at 30 to prevent the terminal from scrolling too far
+    num_bins = min(int((upper_bound - lower_bound) / 1000), 30)
+    #num_bins = int((upper_bound - lower_bound) / 1000)
+
+    # If the range is 0 (all latencies same), num_bins is 0. Fix to 1.
+    if num_bins < 1: num_bins = 1
+
+    print(plotille.hist(lats, bins=num_bins, width=70))
+
     print("\n[ Cumulative Distribution (CDF) ]")
     sorted_lats = sorted(lats)
     n = len(sorted_lats)
