@@ -6,103 +6,90 @@ import os
 import sys
 
 # --- CONFIGURATION ---
-# Change this to the exact name of your JSON file
 JSON_FILENAME = "podLatencyQuantilesMeasurement-rds.json"
+OUTPUT_FILE = "kube_metrics_report.csv"
 
-
-def parse_golang_log(line):
-    # This regex captures: key=value OR key="value with spaces"
-    # Group 1: key, Group 2: value (handling quotes)
+def parse_logfmt_line(line):
+    """Parses Golang logfmt style: key=value or key=\"value with spaces\""""
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
     matches = re.findall(pattern, line)
+    return {m[0]: (m[1] if m[1] else m[2]) for m in matches}
 
-    # Convert matches to a dictionary: {'level': 'info', 'msg': '...', ...}
-    log_dict = {m[0]: (m[1] if m[1] else m[2]) for m in matches}
-    return log_dict
+def extract_metrics(msg_content):
+    """Extracts numeric values from the msg string."""
+    # Pattern looks for 'label: value ms'
+    metrics = {
+        'p99': re.search(r"99th: (\d+)", msg_content),
+        'max': re.search(r"max: (\d+)", msg_content),
+        'avg': re.search(r"avg: (\d+)", msg_content)
+    }
+    # Return integer value if found, else None
+    return {k: (int(v.group(1)) if v else None) for k, v in metrics.items()}
 
 def process_automation():
-    # Capture UUID fragments from command line
     uuid_fragments = sys.argv[1:]
-
     if not uuid_fragments:
-        print(f"Usage: python3 {sys.argv[0]} <uuid1> <uuid2> ...")
+        print(f"Usage: python3 {sys.argv[0]} <uuid_fragment1> ...")
         return
 
     results = []
 
     for frag in uuid_fragments:
-        print(f"--- Searching for fragment: {frag} ---")
-
-        # 1. Find the Directory matching the fragment
-        # This looks for any directory in the current folder containing the fragment
+        # Find directory matching fragment
         dir_matches = glob.glob(f"*{frag}*/")
-
         if not dir_matches:
-            print(f"Skipping: No directory found for {frag}")
+            print(f"Skipping: No folder found for {frag}")
             continue
 
-        target_dir = dir_matches[0] # Take the first match
+        target_dir = dir_matches[0]
 
-        # 2. Find the LOG file inside that specific directory
-        # Uses the fragment to identify the log file
+        # 1. Process LOG file inside the directory
         log_files = glob.glob(f"*{frag}*.log")
 
-        log_val = "N/A"
-        p99_val = "n/a"
-        max_val = "n/a"
-        avg_val = "n/a"
+        row_data = {
+            'uuid': frag,
+            'p99_ms': None,
+            'max_ms': None,
+            'avg_ms': None,
+            'json_calc': 0
+        }
 
         if log_files:
             with open(log_files[0], 'r') as f:
-                print(f"Searching {f}")
                 for line in f:
-                    # REPLACE: Your grep logic
-                    # Example: searching for 'throughput: 500'
+                    # We only care about lines with PodScheduled metrics
                     if "PodScheduled" in line:
-                        log_val = line.split("PodScheduled")[1].strip()
-                        log_line_split = log_val.split(" ")
-                        p99_val = log_line_split[1]
-                        max_val = log_line_split[4]
-                        avg_val = log_line_split[7]
-                        print(log_line_split)
-                        break
+                        parsed_line = parse_logfmt_line(line)
+                        msg = parsed_line.get("msg", "")
+                        print(msg)
+                        metrics = extract_metrics(msg)
+                        row_data.update({
+                            'p99_ms': metrics['p99'],
+                            'max_ms': metrics['max'],
+                            'avg_ms': metrics['avg']
+                        })
+                        break # Stop after finding the first matching metric line
 
-        # 3. Find the Static JSON file inside that specific directory
-#        json_path = os.path.join(target_dir, JSON_FILENAME)
-#        calc_result = 0
-#
-#        if os.path.exists(json_path):
-#            with open(json_path, 'r') as f:
-#                try:
-#                    data = json.load(f)
-#                    # REPLACE: Your calculation logic
-#                    # Example: data['raw_metric'] * 2
-#                    raw_data = data.get('raw_metric', 0)
-#                    calc_result = raw_data * 1.5
-#                except json.JSONDecodeError:
-#                    print(f"Error: Invalid JSON in {json_path}")
+        # 2. Process JSON file (Calculation Placeholder)
+        json_path = os.path.join(target_dir, JSON_FILENAME)
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                try:
+                    data = json.load(f)
+                    # Placeholder: replace 'raw_value' with your actual JSON key
+                    row_data['json_calc'] = data.get('raw_value', 0) * 1.0
+                except:
+                    pass
 
-        # 4. Save the row
-        results.append({
-            'uuid_fragment': frag,
-            'p99': p99_val,
-            'max': max_val,
-            'avg': avg_val,
-            'json_calc': '0.0',
-            'folder': target_dir
-        })
+        results.append(row_data)
 
-    # --- CSV EXPORT ---
-    if not results:
-        return
-
-    output_file = 'processed_results.csv'
-    with open(output_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"\nSuccess! Exported {len(results)} rows to {output_file}")
+    # 3. Save to CSV
+    if results:
+        with open(OUTPUT_FILE, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"Success! Created {OUTPUT_FILE} with {len(results)} rows.")
 
 if __name__ == "__main__":
     process_automation()
