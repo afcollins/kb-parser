@@ -7,20 +7,23 @@ import os
 import sys
 import statistics
 
-# --- 1. COLUMN ORDER CONFIGURATION ---
-# Rearrange these strings to change the order in your CSV/Spreadsheet
-COLUMNS_START = [
-    "OCP Version", "k-b version", "workers", "workload", "scheduler",
-    "iterations", "podReplicas", "start time", "UUID", "p99",
-    "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took", "sched_p90"
-]
-QUANTILES = [f"P{i:02d}" for i in range(5, 100, 5)]
-COLUMN_ORDER = COLUMNS_START + QUANTILES
+# Attempt to import plotille for terminal visuals
+try:
+    import plotille
+except ImportError:
+    print("[!] Run 'pip install plotille' to enable terminal graphing.")
+    plotille = None
 
-# --- 2. FILE NAMES ---
+# --- 1. DYNAMIC COLUMN CONFIGURATION ---
+BASE_START = ["OCP Version", "k-b version", "workers", "workload", "scheduler", "iterations", "podReplicas", "start time", "UUID"]
+BASE_END = ["p99", "max", "avg", "stddev", "end time", "job_took", "percent", "duration", "cycles"]
+QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
+COLUMN_ORDER = BASE_START + BASE_END + QUANTILES_HEADERS
+
+# --- 2. CONFIGURATION ---
 METRICS_FILENAME = "podLatencyMeasurement-rds.json"
 SUMMARY_FILENAME = "jobSummary.json"
-OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
+OUTPUT_FILE = "kube_burner_final_report.csv"
 
 def parse_logfmt_line(line):
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
@@ -35,21 +38,40 @@ def extract_log_metrics(msg_content):
     }
     return {k: (int(v.group(1)) if v else 0) for k, v in metrics.items()}
 
+def print_visuals(lats, frag):
+    if not plotille or not lats:
+        return
+
+    print(f"\n\033[1;34m" + "="*20 + f" VISUALS FOR {frag} " + "="*20 + "\033[0m")
+
+    # Histogram: Shows Frequency/Bottlenecks
+    print("\n[ Frequency Histogram ]")
+    print(plotille.hist(lats, bins=20, width=70))
+
+    # CDF: Shows Progression/S-Curve
+    print("\n[ Cumulative Distribution (CDF) ]")
+    sorted_lats = sorted(lats)
+    n = len(sorted_lats)
+    y_values = [i / n for i in range(n)]
+    fig = plotille.Figure()
+    fig.width, fig.height = 70, 15
+    fig.plot(sorted_lats, y_values)
+    print(fig.show())
+    print("\033[1;34m" + "="*70 + "\033[0m\n")
+
 def process_automation():
     uuid_fragments = sys.argv[1:]
     if not uuid_fragments:
-        print(f"Usage: python3 {sys.argv[0]} <fragment1> ...")
+        print(f"Usage: kb-parse <fragment1> <fragment2> ...")
         return
 
     results = []
 
     for frag in uuid_fragments:
-        print(f"--- Processing: {frag} ---")
-
-        # Internal storage using a dictionary
         data = {}
+        lats = []
 
-        # 1. LOG PROCESSING (Current Directory)
+        # --- LOG PROCESSING ---
         log_files = glob.glob(f"*{frag}*.log")
         if log_files:
             with open(log_files[0], 'r') as f:
@@ -61,95 +83,77 @@ def process_automation():
                         parsed = parse_logfmt_line(line)
                         msg = parsed.get('msg', '')
                         if "Starting kube-burner" in msg:
-                            v_match = re.search(r"\((.*?)\)", msg)
                             u_match = re.search(r"UUID ([a-f0-9\-]+)", msg)
-                            if v_match: data['k-b version'] = v_match.group(1).split('@')[0]
+                            v_match = re.search(r"\((.*?)\)", msg)
                             if u_match: data['UUID'] = u_match.group(1)
+                            if v_match: data['k-b version'] = v_match.group(1).split('@')[0]
+                        if "took" in msg and "Job" in msg:
+                            d_match = re.search(r"took ([\w\.]+)", msg)
+                            if d_match: data['job_took'] = d_match.group(1)
                         if "PodScheduled" in msg:
                             m = extract_log_metrics(msg)
                             data.update({'p99': m['p99'], 'max': m['max'], 'avg': m['avg']})
-                        if "took" in msg and "Job" in msg:
-                            d_match = re.search(r"took ([\w\.]+)", msg)
-                            if d_match:
-                                # Changed key from 'job_duration' to 'job_took' to match the list above
-                                data['job_took'] = d_match.group(1)
 
-
-        # 2. SUBDIRECTORY PROCESSING (JSON files)
+        # --- JSON PROCESSING ---
         dir_matches = glob.glob(f"*{frag}*/")
         if dir_matches:
             target_dir = dir_matches[0]
 
-            # --- Handle jobSummary.json ---
+            # 1. jobSummary
             summary_path = os.path.join(target_dir, SUMMARY_FILENAME)
-            if os.path.exists(summary_path):
+            try:
                 with open(summary_path, 'r') as f:
-                    try:
-                        summary_data = json.load(f)[0]
-                        data['OCP Version'] = summary_data.get('ocpVersion', '-')
-                        data['scheduler'] = summary_data.get('scheduler', '-')
-                        data['podReplicas'] = summary_data.get('podReplicas', '-')
-                        data['workers'] = summary_data.get('otherNodesCount', 0)
+                    summary_data = json.load(f)[0]
+                    data.update({
+                        'OCP Version': summary_data.get('ocpVersion', 'N/A'),
+                        'scheduler': summary_data.get('scheduler', 'N/A'),
+                        'podReplicas': summary_data.get('podReplicas', 0),
+                        'workers': summary_data.get('otherNodesCount', 0)
+                    })
+                    job_cfg = summary_data.get('jobConfig', {})
+                    data['workload'] = job_cfg.get('name', 'N/A')
+                    data['iterations'] = job_cfg.get('jobIterations', 0)
+                    churn = job_cfg.get('churnConfig', {})
+                    data.update({
+                        'cycles': churn.get('cycles', 0),
+                        'percent': churn.get('percent', 0),
+                        'duration': f"{int(churn.get('duration', 0) / 60_000_000_000)}m"
+                    })
+            except Exception as e: print(f"[!] Error Summary JSON: {e}")
 
-                        job_cfg = summary_data.get('jobConfig', {})
-                        data['workload'] = job_cfg.get('name', '-')
-                        data['iterations'] = job_cfg.get('jobIterations', 0)
-
-                        churn = job_cfg.get('churnConfig', {})
-                        data['cycles'] = churn.get('cycles', '-')
-                        data['percent'] = churn.get('percent', '-')
-                        raw_dur = (churn.get('duration', '-') or 0)
-                        data['duration'] = f"{int(raw_dur / 60_000_000_000)}m"
-                    except: pass
-
-            # --- Handle metadata.json (Latencies) ---
+            # 2. metadata (Latencies)
             metrics_path = os.path.join(target_dir, METRICS_FILENAME)
-            if os.path.exists(metrics_path):
+            try:
                 with open(metrics_path, 'r') as f:
-                    try:
-                        m_list = json.load(f)
-                        lats = [i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i]
-                        if len(lats) > 1:
-                            data['stddev'] = round(statistics.stdev(lats), 2)
-                            # n=10 splits data into 10 groups, the 9th index is the 90th percentile
-                            data['sched_p90'] = statistics.quantiles(lats, n=10)[8]
+                    m_list = json.load(f)
+                    lats = [i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i]
+                    if lats:
+                        print_visuals(lats, frag)
+                        data['stddev'] = round(statistics.stdev(lats), 2) if len(lats) > 1 else 0
+                        data['Spread'] = max(lats) - min(lats)
+                        data['CV'] = round((data['stddev'] / (sum(lats)/len(lats))), 3) if sum(lats) > 0 else 0
+                        dist = statistics.quantiles(lats, n=20)
+                        for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
+            except Exception as e: print(f"[!] Error Metrics JSON: {e}")
 
-                            # n=20 gives us 5% intervals (100/5 = 20)
-                            # This returns a list of 19 values (P05, P10 ... P95)
-                            dist_values = statistics.quantiles(lats, n=20)
+        results.append({col: data.get(col, 'N/A') for col in COLUMN_ORDER + ['Spread', 'CV']})
 
-                            # Map the calculated values to our dynamic headers
-                            for i, q_header in enumerate(QUANTILES):
-                                data[q_header] = round(dist_values[i], 2)
-                        else:
-                            data['stddev'] = 0
-                            for qh in QUANTILES_HEADERS: data[qh] = 0
-                    except FileNotFoundError:
-                            print(f"Warning: Summary file missing for {frag}")
-                    except json.JSONDecodeError:
-                            print(f"Error: {summary_path} contains invalid JSON")
+    # --- FINAL SUMMARY TABLE ---
+    print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
+    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Avg (ms)':<10} | {'Spread':<10} | {'Consistency (CV)':<15}")
+    print("-" * 75)
+    for r in results:
+        avg = r.get('avg', 0)
+        cv = r.get('CV', 0)
+        status = "✅ Stable" if cv < 0.2 else "⚠️ Noisy" if cv < 0.5 else "❌ High Variance"
+        print(f"{r['UUID'][:8]:<12} | {r['scheduler']:<15} | {avg:<10} | {r['Spread']:<10} | {cv:<15} {status}")
 
-        # Ensure all columns exist in the row even if missing from files
-        row = {col: data.get(col, '-') for col in COLUMN_ORDER}
-        results.append(row)
-
-    # 3. CSV EXPORT
-    if results:
-        with open(OUTPUT_FILE, 'w', newline='') as f:
-            # The 'extrasaction' parameter prevents crashes if a key is missing
-            writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(results)
-
-        # Write to Standard Out (Console)
-        print(f"\n--- CSV DATA START ---\n")
-        # We use sys.stdout as the 'file' for the writer
-        console_writer = csv.DictWriter(sys.stdout, fieldnames=COLUMN_ORDER, extrasaction='ignore')
-        console_writer.writeheader()
-        console_writer.writerows(results)
-        print(f"\n--- CSV DATA END ---\n")
-
-        print(f"\nReport ready: {OUTPUT_FILE}")
+    # --- CSV SAVE ---
+    with open(OUTPUT_FILE, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nFull report saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     process_automation()
