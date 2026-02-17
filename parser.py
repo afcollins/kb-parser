@@ -5,82 +5,104 @@ import glob
 import os
 import sys
 
-def find_files_by_fragment(fragments, extension):
-    """Finds all files in the current dir containing any of the fragments."""
-    matched_files = []
-    for frag in fragments:
-        # Matches any file containing the fragment and ending with the extension
-        search_pattern = f"*{frag}*{extension}"
-        matched_file = glob.glob(search_pattern, recursive=True)
-        print(f"Matched file: {matched_file}")
-        matched_files.extend(matched_file)
-    return list(set(matched_files))
+# --- CONFIGURATION ---
+# Change this to the exact name of your JSON file
+JSON_FILENAME = "podLatencyQuantilesMeasurement-rds.json"
+
+
+def parse_golang_log(line):
+    # This regex captures: key=value OR key="value with spaces"
+    # Group 1: key, Group 2: value (handling quotes)
+    pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
+    matches = re.findall(pattern, line)
+
+    # Convert matches to a dictionary: {'level': 'info', 'msg': '...', ...}
+    log_dict = {m[0]: (m[1] if m[1] else m[2]) for m in matches}
+    return log_dict
 
 def process_automation():
-    # --- CLI ARGUMENT LOGIC ---
-    # sys.argv[0] is the script name; sys.argv[1:] are the UUIDs you type
+    # Capture UUID fragments from command line
     uuid_fragments = sys.argv[1:]
 
     if not uuid_fragments:
-        print("Usage: python3 parser.py <uuid_fragment1> <uuid_fragment2> ...")
-        print("Example: python3 parser.py a1b2 889c")
+        print(f"Usage: python3 {sys.argv[0]} <uuid1> <uuid2> ...")
         return
 
     results = []
 
-    # 1. Process LOG Files
-    log_files = find_files_by_fragment(uuid_fragments, ".log")
-    for log_path in log_files:
-        try:
-            with open(log_path, 'r') as f:
+    for frag in uuid_fragments:
+        print(f"--- Searching for fragment: {frag} ---")
+
+        # 1. Find the Directory matching the fragment
+        # This looks for any directory in the current folder containing the fragment
+        dir_matches = glob.glob(f"*{frag}*/")
+
+        if not dir_matches:
+            print(f"Skipping: No directory found for {frag}")
+            continue
+
+        target_dir = dir_matches[0] # Take the first match
+
+        # 2. Find the LOG file inside that specific directory
+        # Uses the fragment to identify the log file
+        log_files = glob.glob(f"*{frag}*.log")
+
+        log_val = "N/A"
+        p99_val = "n/a"
+        max_val = "n/a"
+        avg_val = "n/a"
+
+        if log_files:
+            with open(log_files[0], 'r') as f:
+                print(f"Searching {f}")
                 for line in f:
-                    # Replace with your actual regex
-                    match = re.search(r"Status: (\w+)", line)
-                    if match:
-                        results.append({
-                            'uuid_ref': os.path.basename(log_path),
-                            'type': 'Log Entry',
-                            'data': match.group(1)
-                        })
-        except Exception as e:
-            print(f"Error reading {log_path}: {e}")
+                    # REPLACE: Your grep logic
+                    # Example: searching for 'throughput: 500'
+                    if "PodScheduled" in line:
+                        log_val = line.split("PodScheduled")[1].strip()
+                        log_line_split = log_val.split(" ")
+                        p99_val = log_line_split[1]
+                        max_val = log_line_split[4]
+                        avg_val = log_line_split[7]
+                        print(log_line_split)
+                        break
 
-    # 2. Process JSON Files + Calculation
-    json_files = find_files_by_fragment(uuid_fragments, ".json")
-    for json_path in json_files:
-        try:
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-                
-                # Calculation Logic
-                # Example: Calculate a 15% tax or margin on a 'price' field
-                raw_value = data.get('amount', 0)
-                calculated_value = raw_value * 1.15 
+        # 3. Find the Static JSON file inside that specific directory
+#        json_path = os.path.join(target_dir, JSON_FILENAME)
+#        calc_result = 0
+#
+#        if os.path.exists(json_path):
+#            with open(json_path, 'r') as f:
+#                try:
+#                    data = json.load(f)
+#                    # REPLACE: Your calculation logic
+#                    # Example: data['raw_metric'] * 2
+#                    raw_data = data.get('raw_metric', 0)
+#                    calc_result = raw_data * 1.5
+#                except json.JSONDecodeError:
+#                    print(f"Error: Invalid JSON in {json_path}")
 
-                results.append({
-                    'uuid_ref': os.path.basename(json_path),
-                    'type': 'JSON Calc',
-                    'data': round(calculated_value, 2)
-                })
-        except Exception as e:
-            print(f"Error reading {json_path}: {e}")
+        # 4. Save the row
+        results.append({
+            'uuid_fragment': frag,
+            'p99': p99_val,
+            'max': max_val,
+            'avg': avg_val,
+            'json_calc': '0.0',
+            'folder': target_dir
+        })
 
-    # 3. Save to CSV
+    # --- CSV EXPORT ---
     if not results:
-        print(f"No files found matching fragments: {uuid_fragments}")
         return
 
-    output_file = 'final_report.csv'
+    output_file = 'processed_results.csv'
     with open(output_file, 'w', newline='') as f:
-        # Uses the keys from the first result dictionary as headers
         writer = csv.DictWriter(f, fieldnames=results[0].keys())
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"--- Process Complete ---")
-    print(f"Files Scanned: {len(log_files) + len(json_files)}")
-    print(f"Rows Created:  {len(results)}")
-    print(f"Output saved to: {output_file}")
+    print(f"\nSuccess! Exported {len(results)} rows to {output_file}")
 
 if __name__ == "__main__":
     process_automation()
