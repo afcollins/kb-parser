@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+from collections import Counter
 import os
 import re
 import statistics
@@ -35,6 +36,15 @@ OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
 
 # --- 2. HELPER FUNCTIONS ---
 
+def get_pretty_step(total_range_ms):
+    """Returns a clean step size (1s, 2s, 5s, 10s, etc.) based on total range."""
+    # Convert range to seconds for easier logic
+    range_sec = total_range_ms / 1000
+    if range_sec <= 30: return 1000  # 1s
+    if range_sec <= 90: return 2000  # 2s
+    if range_sec <= 300: return 10000 # 10s
+    return 30000 # 30s
+
 def parse_logfmt_line(line):
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
     matches = re.findall(pattern, line)
@@ -66,23 +76,36 @@ def find_pairs_recursively(fragments):
 def print_visuals(lats, frag):
     if not plotille or not lats:
         return
+    # 1. Determine Step
+    lats_min, lats_max = min(lats), max(lats)
+    step = get_pretty_step(lats_max - lats_min)
+
+    # 2. SNAP DATA TO GRID
+    # We transform the data into bucket labels (e.g., 2000, 4000, 6000)
+    snapped_data = [math.floor(x / step) * step for x in lats]
+    counts = Counter(snapped_data)
+
+    # 3. Build a sorted list of buckets to display
+    # This ensures we don't miss empty buckets in the middle
+    start_bucket = math.floor(lats_min / step) * step
+    end_bucket = math.floor(lats_max / step) * step
+
     print(f"\n\033[1;34m" + "="*20 + f" VISUALS FOR {frag} " + "="*20 + "\033[0m")
-    # --- Clean Histogram Logic ---
-    print("\n[ Frequency Histogram (Exact 1000ms Buckets) ]")
+    print(f"\n[ Frequency Histogram ({step/1000:g}s Exact Buckets) ]")
+    print(f"{'Bucket Range (ms)':<20} | {'Chart':<45} | Count")
+    print("-" * 75)
 
-    # 1. Manually calculate boundaries to ensure they are even 1000s
-    lower_bound = math.floor(min(lats) / 1000) * 1000
-    upper_bound = math.ceil(max(lats) / 1000) * 1000
+    max_count = max(counts.values()) if counts else 1
 
-    # 2. Determine number of bins (1 per 1000ms)
-    # We cap this at 30 to prevent the terminal from scrolling too far
-    num_bins = min(int((upper_bound - lower_bound) / 1000), 30)
-    #num_bins = int((upper_bound - lower_bound) / 1000)
+    curr = start_bucket
+    while curr <= end_bucket:
+        cnt = counts.get(curr, 0)
+        # Create a simple ASCII bar based on percentage of max
+        bar_len = int((cnt / max_count) * 40) if max_count > 0 else 0
+        bar = "⣿" * bar_len
 
-    # If the range is 0 (all latencies same), num_bins is 0. Fix to 1.
-    if num_bins < 1: num_bins = 1
-
-    print(plotille.hist(lats, bins=num_bins, width=70))
+        print(f"[{curr:<7}, {curr+step:<7}) | {bar:<45} | {cnt}")
+        curr += step
 
     print("\n[ Cumulative Distribution (CDF) ]")
     sorted_lats = sorted(lats)
