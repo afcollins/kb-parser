@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import json
 import csv
 import re
@@ -6,10 +7,20 @@ import os
 import sys
 import statistics
 
-# --- CONFIGURATION ---
+# --- 1. COLUMN ORDER CONFIGURATION ---
+# Rearrange these strings to change the order in your CSV/Spreadsheet
+COLUMNS_START = [
+    "OCP Version", "k-b version", "workers", "workload", "scheduler",
+    "iterations", "podReplicas", "start time", "UUID", "p99",
+    "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took", "sched_p90"
+]
+QUANTILES = [f"P{i:02d}" for i in range(5, 100, 5)]
+COLUMN_ORDER = COLUMNS_START + QUANTILES
+
+# --- 2. FILE NAMES ---
 METRICS_FILENAME = "podLatencyMeasurement-rds.json"
 SUMMARY_FILENAME = "jobSummary.json"
-OUTPUT_FILE = "kube_burner_final_report.csv"
+OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
 
 def parse_logfmt_line(line):
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
@@ -27,7 +38,7 @@ def extract_log_metrics(msg_content):
 def process_automation():
     uuid_fragments = sys.argv[1:]
     if not uuid_fragments:
-        print(f"Usage: python3 {sys.argv[0]} <fragment1> <fragment2> ...")
+        print(f"Usage: python3 {sys.argv[0]} <fragment1> ...")
         return
 
     results = []
@@ -35,13 +46,8 @@ def process_automation():
     for frag in uuid_fragments:
         print(f"--- Processing: {frag} ---")
 
-        row = {
-            'full_uuid': 'N/A', 'version': 'N/A', 'start_time': 'N/A', 'end_time': 'N/A',
-            'job_duration': 'N/A', 'ocpVersion': 'N/A', 'scheduler': 'N/A',
-            'podReplicas': 0, 'jobIterations': 0, 'churn_cycles': 0,
-            'churn_minutes': 0, 'churn_percent': 0, 'log_p99_ms': 0,
-            'log_max_ms': 0, 'log_avg_ms': 0, 'sched_stddev': 0, 'sched_p50': 0
-        }
+        # Internal storage using a dictionary
+        data = {}
 
         # 1. LOG PROCESSING (Current Directory)
         log_files = glob.glob(f"*{frag}*.log")
@@ -49,22 +55,25 @@ def process_automation():
             with open(log_files[0], 'r') as f:
                 lines = f.readlines()
                 if lines:
-                    row['start_time'] = parse_logfmt_line(lines[0]).get('time', 'N/A')
-                    row['end_time'] = parse_logfmt_line(lines[-1]).get('time', 'N/A')
+                    data['start time'] = parse_logfmt_line(lines[0]).get('time', 'N/A')
+                    data['end time'] = parse_logfmt_line(lines[-1]).get('time', 'N/A')
                     for line in lines:
                         parsed = parse_logfmt_line(line)
                         msg = parsed.get('msg', '')
                         if "Starting kube-burner" in msg:
                             v_match = re.search(r"\((.*?)\)", msg)
                             u_match = re.search(r"UUID ([a-f0-9\-]+)", msg)
-                            if v_match: row['version'] = v_match.group(1).split('@')[0]
-                            if u_match: row['full_uuid'] = u_match.group(1)
-                        if "took" in msg and "Job" in msg:
-                            d_match = re.search(r"took ([\w\.]+)", msg)
-                            if d_match: row['job_duration'] = d_match.group(1)
+                            if v_match: data['k-b version'] = v_match.group(1).split('@')[0]
+                            if u_match: data['UUID'] = u_match.group(1)
                         if "PodScheduled" in msg:
                             m = extract_log_metrics(msg)
-                            row.update({'log_p99_ms': m['p99'], 'log_max_ms': m['max'], 'log_avg_ms': m['avg']})
+                            data.update({'p99': m['p99'], 'max': m['max'], 'avg': m['avg']})
+                        if "took" in msg and "Job" in msg:
+                            d_match = re.search(r"took ([\w\.]+)", msg)
+                            if d_match:
+                                # Changed key from 'job_duration' to 'job_took' to match the list above
+                                data['job_took'] = d_match.group(1)
+
 
         # 2. SUBDIRECTORY PROCESSING (JSON files)
         dir_matches = glob.glob(f"*{frag}*/")
@@ -76,46 +85,71 @@ def process_automation():
             if os.path.exists(summary_path):
                 with open(summary_path, 'r') as f:
                     try:
-                        summary_data = json.load(f)[0] # It's a list
-                        row['ocpVersion'] = summary_data.get('ocpVersion', 'N/A')
-                        row['scheduler'] = summary_data.get('scheduler', 'N/A')
-                        row['podReplicas'] = summary_data.get('podReplicas', 0)
+                        summary_data = json.load(f)[0]
+                        data['OCP Version'] = summary_data.get('ocpVersion', '-')
+                        data['scheduler'] = summary_data.get('scheduler', '-')
+                        data['podReplicas'] = summary_data.get('podReplicas', '-')
+                        data['workers'] = summary_data.get('otherNodesCount', 0)
 
                         job_cfg = summary_data.get('jobConfig', {})
-                        row['jobIterations'] = job_cfg.get('jobIterations', 0)
+                        data['workload'] = job_cfg.get('name', '-')
+                        data['iterations'] = job_cfg.get('jobIterations', 0)
 
                         churn = job_cfg.get('churnConfig', {})
-                        row['churn_cycles'] = churn.get('cycles', 0)
-                        row['churn_percent'] = churn.get('percent', 0)
-                        # Convert nanoseconds to minutes
-                        row['churn_minutes'] = churn.get('duration', 0) / 60_000_000_000
-                    except Exception as e:
-                        print(f"  Error parsing jobSummary: {e}")
+                        data['cycles'] = churn.get('cycles', '-')
+                        data['percent'] = churn.get('percent', '-')
+                        raw_dur = (churn.get('duration', '-') or 0)
+                        data['duration'] = f"{int(raw_dur / 60_000_000_000)}m"
+                    except: pass
 
             # --- Handle metadata.json (Latencies) ---
             metrics_path = os.path.join(target_dir, METRICS_FILENAME)
             if os.path.exists(metrics_path):
                 with open(metrics_path, 'r') as f:
                     try:
-                        m_data = json.load(f)
-                        lats = [i['schedulingLatency'] for i in m_data if 'schedulingLatency' in i]
+                        m_list = json.load(f)
+                        lats = [i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i]
                         if len(lats) > 1:
-                            row['sched_stddev'] = round(statistics.stdev(lats), 2)
-                            row['sched_p50'] = statistics.median(lats)
-                        elif lats:
-                            row['sched_p50'] = lats[0]
-                    except:
-                        pass
+                            data['stddev'] = round(statistics.stdev(lats), 2)
+                            # n=10 splits data into 10 groups, the 9th index is the 90th percentile
+                            data['sched_p90'] = statistics.quantiles(lats, n=10)[8]
 
+                            # n=20 gives us 5% intervals (100/5 = 20)
+                            # This returns a list of 19 values (P05, P10 ... P95)
+                            dist_values = statistics.quantiles(lats, n=20)
+
+                            # Map the calculated values to our dynamic headers
+                            for i, q_header in enumerate(QUANTILES):
+                                data[q_header] = round(dist_values[i], 2)
+                        else:
+                            data['stddev'] = 0
+                            for qh in QUANTILES_HEADERS: data[qh] = 0
+                    except FileNotFoundError:
+                            print(f"Warning: Summary file missing for {frag}")
+                    except json.JSONDecodeError:
+                            print(f"Error: {summary_path} contains invalid JSON")
+
+        # Ensure all columns exist in the row even if missing from files
+        row = {col: data.get(col, '-') for col in COLUMN_ORDER}
         results.append(row)
 
     # 3. CSV EXPORT
     if results:
         with open(OUTPUT_FILE, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            # The 'extrasaction' parameter prevents crashes if a key is missing
+            writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
-        print(f"\nReport ready for spreadsheet: {OUTPUT_FILE}")
+
+        # Write to Standard Out (Console)
+        print(f"\n--- CSV DATA START ---\n")
+        # We use sys.stdout as the 'file' for the writer
+        console_writer = csv.DictWriter(sys.stdout, fieldnames=COLUMN_ORDER, extrasaction='ignore')
+        console_writer.writeheader()
+        console_writer.writerows(results)
+        print(f"\n--- CSV DATA END ---\n")
+
+        print(f"\nReport ready: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     process_automation()
