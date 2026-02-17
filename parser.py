@@ -14,16 +14,25 @@ except ImportError:
     plotille = None
 
 # --- 1. DYNAMIC COLUMN CONFIGURATION ---
-BASE_START = ["OCP Version", "k-b version", "workers", "workload", "scheduler", "iterations", "podReplicas", "start time", "UUID"]
-BASE_END = ["p99", "max", "avg", "stddev", "end time", "job_took", "percent", "duration", "cycles"]
+# Percentiles we want to calculate
 QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
-COLUMN_ORDER = BASE_START + BASE_END + QUANTILES_HEADERS
+
+# We define the order by finding 'job_took' and inserting the percentiles right after it
+ORIGINAL_COLUMNS = [
+    "OCP Version", "k-b version", "workers", "workload", "scheduler",
+    "iterations", "podReplicas", "start time", "UUID", "p99",
+    "max", "avg", "stddev", "end time", "job_took", "percent", "duration", "cycles"
+]
+
+COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
 
 # --- 2. CONFIGURATION ---
 METRICS_FILENAME = "podLatencyMeasurement-rds.json"
 SUMMARY_FILENAME = "jobSummary.json"
 OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
 
+
+# --- 2. HELPER FUNCTIONS ---
 
 def parse_logfmt_line(line):
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
@@ -70,6 +79,7 @@ def print_visuals(lats, frag):
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
 # --- 3. MAIN PROCESSING ---
+
 def process_automation():
     uuid_fragments = sys.argv[1:]
     if not uuid_fragments:
@@ -148,11 +158,11 @@ def process_automation():
                     for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
+        # Compile row according to final COLUMN_ORDER
         results.append({col: data.get(col, 'N/A') for col in COLUMN_ORDER + ['Spread', 'CV']})
 
     # --- 4. SUMMARY & CSV EXPORT ---
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
-    # Added 'Replicas' to the header
     print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Spread':<10} | {'Consistency (CV)':<15}")
     print("-" * 110)
 
@@ -169,9 +179,9 @@ def process_automation():
             cv_disp = f"{'N/A':<15}"
 
         label = r['UUID'][:8] if r.get('UUID') != 'N/A' else r.get('uuid_fragment', 'Unknown')
-        # Added replicas to the row print
         print(f"{label:<12} | {r['scheduler']:<15} | {replicas:<10} | {avg:<10} | {r.get('Spread', 'N/A'):<10} | {cv_disp} {status}")
 
+    # Save to file
     with open(OUTPUT_FILE, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
         writer.writeheader()
@@ -186,7 +196,7 @@ def process_automation():
     print(f"--- CSV DATA END ---\n")
 
 
-    print(f"\nReport saved: {OUTPUT_FILE}")
+    print(f"Report saved: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     process_automation()
