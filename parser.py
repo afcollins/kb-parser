@@ -77,76 +77,77 @@ def find_pairs_recursively(fragments):
                     })
     return pairs
 
-def print_visuals(metrics_list, frag, scheduler):
-    if not plotille or not isinstance(metrics_list, list):
-        return
-
-    sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
-    if not sorted_lats: return
-
-    print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
-
-    # --- 1. Scatterplot (Chronological Progress) ---
+def _plot_latency_scatter(metrics_list):
+    """Plot latency over time (seconds from start vs scheduling latency)."""
     data_points = []
     for i in metrics_list:
         if 'timestamp' in i and 'schedulingLatency' in i:
+            # Guard: metrics may have non-ISO or malformed timestamps (e.g. empty, wrong format).
             try:
                 ts = datetime.datetime.fromisoformat(i['timestamp'].replace('Z', '+00:00'))
                 data_points.append((ts, i['schedulingLatency']))
-            except: continue
+            except (ValueError, TypeError) as e:
+                print(f"  [!] Skipping scatter point: invalid timestamp {i.get('timestamp', '')!r}: {e}", file=sys.stderr)
+                continue
+    if not data_points:
+        return
+    data_points.sort(key=lambda x: x[0])
+    start_t = data_points[0][0]
+    x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
+    y_lats = [p[1] for p in data_points]
+    print("\n[ Latency Scatterplot (Time vs. Delay) ]")
+    fig = plotille.Figure()
+    fig.set_x_limits(min_=0)
+    fig.set_y_limits(min_=0)
+    fig.width, fig.height = 70, 12
+    fig.scatter(x_secs, y_lats, lc='cyan')
+    print(fig.show())
 
-    if data_points:
-        data_points.sort(key=lambda x: x[0])
-        start_t = data_points[0][0]
-        x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
-        y_lats = [p[1] for p in data_points]
-        print(f"\n[ Latency Scatterplot (Time vs. Delay) ]")
-        latency_scatter = plotille.Figure()
-        latency_scatter.set_x_limits(min_=0)
-        latency_scatter.set_y_limits(min_=0)
-        latency_scatter.width, latency_scatter.height = 70, 12
-        latency_scatter.scatter(x_secs, y_lats, lc='cyan')
-        print(latency_scatter.show())
 
-    # --- 2. Snap-to-Grid Histogram ---
-
-    # 1. Determine Step
+def _plot_frequency_histogram(sorted_lats):
+    """Plot snap-to-grid frequency histogram of scheduling latencies."""
     lats_min, lats_max = min(sorted_lats), max(sorted_lats)
     step = get_pretty_step(lats_max - lats_min)
-
-    # 2. SNAP DATA TO GRID
-    # We transform the data into bucket labels (e.g., 2000, 4000, 6000)
     snapped_data = [math.floor(x / step) * step for x in sorted_lats]
     counts = Counter(snapped_data)
-
-    # 3. Build a sorted list of buckets to display
-    # This ensures we don't miss empty buckets in the middle
     start_bucket = math.floor(lats_min / step) * step
     end_bucket = math.floor(lats_max / step) * step
-
     print(f"\n[ Frequency Histogram ({step/1000:g}s Buckets) ]")
     print(f"{'Bucket Range (ms)':<18} | {'Chart':<40} | Count")
     max_count = max(counts.values()) if counts else 1
     curr = start_bucket
     while curr <= end_bucket:
         cnt = counts.get(curr, 0)
-        # Create a simple ASCII bar based on percentage of max
         bar_len = int((cnt / max_count) * 40) if max_count > 0 else 0
         bar = "⣿" * bar_len
-
         print(f"[{curr:<7}, {curr+step:<7}) | {bar:<40} | {cnt}")
         curr += step
 
-    # --- 3. CDF Line ---
+
+def _plot_cdf(sorted_lats):
+    """Plot cumulative distribution of scheduling latencies."""
     print("\n[ Cumulative Distribution (CDF) ]")
     n = len(sorted_lats)
     y_vals = [i / n for i in range(n)]
-    cdf = plotille.Figure()
-    cdf.set_x_limits(min_=0)
-    cdf.set_y_limits(min_=0,max_=1)
-    cdf.width, cdf.height = 70, 12
-    cdf.plot(sorted_lats, y_vals)
-    print(cdf.show())
+    fig = plotille.Figure()
+    fig.set_x_limits(min_=0)
+    fig.set_y_limits(min_=0, max_=1)
+    fig.width, fig.height = 70, 12
+    fig.plot(sorted_lats, y_vals)
+    print(fig.show())
+
+
+def print_visuals(metrics_list, frag, scheduler):
+    if not plotille or not isinstance(metrics_list, list):
+        return
+    sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
+    if not sorted_lats:
+        return
+
+    print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
+    _plot_latency_scatter(metrics_list)
+    _plot_frequency_histogram(sorted_lats)
+    _plot_cdf(sorted_lats)
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
 def process_automation(uuid_fragments, no_visuals=False):
