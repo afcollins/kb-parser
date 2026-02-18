@@ -269,7 +269,15 @@ def process_automation(uuid_fragments, no_visuals=False):
     print("-" * 110)
     for r in results:
         cv = r.get('CV', 0)
-        status = "✅ Stable" if (isinstance(cv, float) and cv < 0.2) else "❌ High Var"
+        if isinstance(cv, (int, float)):
+            if cv > 0.7:
+                status = "🔥 Bursty (optimal)"
+            elif cv >= 0.6:
+                status = "📊 Steady (tool-limited?)"
+            else:
+                status = "🐌 Fixed rate (queue loaded)"
+        else:
+            status = "—"
         print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {r.get('avg_pods_per_sec',''):<10} | {cv:<15} {status}")
 
     # CSV Dump (always write to file)
