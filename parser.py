@@ -270,12 +270,12 @@ def process_automation(uuid_fragments, no_visuals=False):
     for r in results:
         cv = r.get('CV', 0)
         if isinstance(cv, (int, float)):
-            if cv > 0.7:
+            if cv >= 0.8:
                 status = "🔥 Bursty (optimal)"
-            elif cv >= 0.6:
-                status = "📊 Steady (tool-limited?)"
+            elif cv >= 0.7:
+                status = "⚠️ Likely serial - check scatterplot"
             else:
-                status = "🐌 Fixed rate (queue loaded)"
+                status = "🐌 Serial scheduling rate"
         else:
             status = "—"
         print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {r.get('avg_pods_per_sec',''):<10} | {cv:<15} {status}")
