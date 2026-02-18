@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 from collections import Counter
 import csv
 import datetime
@@ -148,10 +149,9 @@ def print_visuals(metrics_list, frag, scheduler):
     print(cdf.show())
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
-def process_automation():
-    uuid_fragments = sys.argv[1:]
+def process_automation(uuid_fragments, no_visuals=False):
     if not uuid_fragments:
-        print(f"Usage: kb-parse <fragment1> <fragment2> ...")
+        print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
 
     discovered_pairs = find_pairs_recursively(uuid_fragments)
@@ -217,7 +217,8 @@ def process_automation():
                 m_list = json.load(f)
                 if isinstance(m_list, list):
                     lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
-                    print_visuals(m_list, pair['fragment'], data['scheduler'])
+                    if not no_visuals:
+                        print_visuals(m_list, pair['fragment'], data['scheduler'])
                     data['stddev'] = round(statistics.stdev(lats), 2)
                     data['Spread'] = max(lats) - min(lats)
                     data['avg'] = round(statistics.mean(lats), 2)
@@ -230,7 +231,7 @@ def process_automation():
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
 
-    # Summary Table
+    # Summary Table — always printed
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
     print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Consistency (CV)':<15}")
     print("-" * 85)
@@ -239,18 +240,27 @@ def process_automation():
         status = "✅ Stable" if (isinstance(cv, float) and cv < 0.2) else "❌ High Var"
         print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {cv:<15} {status}")
 
-    # CSV Dump
+    # CSV Dump (always write to file)
     with open(OUTPUT_FILE, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(results)
 
-    # Write to Standard Out (Console)
+    # Write to Standard Out (Console) — always printed
     print("\n" + "="*30 + " CSV RAW DATA " + "="*30)
-    # We use sys.stdout as the 'file' for the writer
     console_writer = csv.DictWriter(sys.stdout, fieldnames=COLUMN_ORDER, extrasaction='ignore')
     console_writer.writeheader()
     console_writer.writerows(results)
 
 if __name__ == "__main__":
-    process_automation()
+    parser = argparse.ArgumentParser(description="Parse kube-burner metrics and produce CSV reports.")
+    parser.add_argument("--no-visuals", action="store_true",
+                        help="Disable the large terminal plots (scatterplot, histogram, CDF) to save space.")
+    parser.add_argument("fragments", nargs="*", help="UUID fragments to search for (e.g. from collected-metrics dirs).")
+    args = parser.parse_args()
+
+    if not args.fragments:
+        parser.print_help()
+        sys.exit(1)
+
+    process_automation(args.fragments, no_visuals=args.no_visuals)
