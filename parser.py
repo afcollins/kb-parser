@@ -27,7 +27,7 @@ ORIGINAL_COLUMNS = [
     "iterations", "podReplicas", "start time", "UUID", "p99",
     "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took",
     "Note", "worker reserved cores", "worker CPUs", "topologyPolicy", "overall duration",
-    "qps burst"
+    "qps burst", "CV"
 ]
 
 COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
@@ -103,6 +103,7 @@ def print_visuals(metrics_list, frag, scheduler):
         print(f"\n[ Latency Scatterplot (Time vs. Delay) ]")
         latency_scatter = plotille.Figure()
         latency_scatter.set_x_limits(min_=0)
+        latency_scatter.set_y_limits(min_=0)
         latency_scatter.width, latency_scatter.height = 70, 12
         latency_scatter.scatter(x_secs, y_lats, lc='cyan')
         print(latency_scatter.show())
