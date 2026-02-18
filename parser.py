@@ -24,7 +24,9 @@ QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
 ORIGINAL_COLUMNS = [
     "OCP Version", "k-b version", "workers", "workload", "scheduler",
     "iterations", "podReplicas", "start time", "UUID", "p99",
-    "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took"
+    "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took",
+    "Note", "worker reserved cores", "worker CPUs", "topologyPolicy", "overall duration",
+    "qps burst"
 ]
 
 COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
