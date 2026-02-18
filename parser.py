@@ -33,7 +33,6 @@ ORIGINAL_COLUMNS = [
 COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
 
 # --- 2. CONFIGURATION ---
-METRICS_FILENAME = "podLatencyMeasurement-rds.json"
 SUMMARY_FILENAME = "jobSummary.json"
 OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
 DEFAULT_VAL = "-"
@@ -210,7 +209,7 @@ def process_automation(uuid_fragments, no_visuals=False):
                 })
         except Exception as e: print(f"  [!] Summary JSON Error: {e}")
 
-        lat_path = os.path.join(pair['metrics_dir'], METRICS_FILENAME)
+        lat_path = os.path.join(pair['metrics_dir'], f"podLatencyMeasurement-{data['workload']}.json")
 
         try:
             with open(lat_path, 'r') as f:
