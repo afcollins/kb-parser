@@ -265,12 +265,12 @@ def process_automation(uuid_fragments, no_visuals=False):
 
     # Summary Table — always printed
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
-    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Max pods/s':<10} | {'Consistency (CV)':<15}")
-    print("-" * 100)
+    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Max pods/s':<10} | {'Avg pods/s':<10} | {'Consistency (CV)':<15}")
+    print("-" * 110)
     for r in results:
         cv = r.get('CV', 0)
         status = "✅ Stable" if (isinstance(cv, float) and cv < 0.2) else "❌ High Var"
-        print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {cv:<15} {status}")
+        print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {r.get('avg_pods_per_sec',''):<10} | {cv:<15} {status}")
 
     # CSV Dump (always write to file)
     with open(OUTPUT_FILE, 'w', newline='') as f:
