@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import csv
 import datetime
 import json
@@ -29,8 +29,11 @@ ORIGINAL_COLUMNS = [
     "Note", "worker reserved cores", "worker CPUs", "topologyPolicy", "overall duration",
     "qps burst", "CV"
 ]
+EXPERIMENTAL_COLUMNS = [
+    "max_pods_per_sec", "avg_pods_per_sec"
+]
 
-COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS
+COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS + EXPERIMENTAL_COLUMNS
 
 # --- 2. CONFIGURATION ---
 SUMMARY_FILENAME = "jobSummary.json"
@@ -76,6 +79,30 @@ def find_pairs_recursively(fragments):
                         'metrics_dir': os.path.join(root, metrics_dir_name)
                     })
     return pairs
+
+def compute_scheduling_throughput(metrics_list):
+    """
+    Compute scheduling throughput from podLatencyMeasurement entries.
+    For each pod: scheduled_time = timestamp + schedulingLatency (ms).
+    Returns (max_pods_per_sec, avg_pods_per_sec, counts_per_second).
+    """
+    second_counts = defaultdict(int)
+    for i in metrics_list:
+        if 'timestamp' not in i or 'schedulingLatency' not in i:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(i['timestamp'].replace('Z', '+00:00'))
+            lat_ms = int(i['schedulingLatency'])
+            scheduled = ts + datetime.timedelta(milliseconds=lat_ms)
+            key = scheduled.replace(microsecond=0)  # truncate to second
+            second_counts[key] += 1
+        except (ValueError, TypeError, KeyError):
+            continue
+    if not second_counts:
+        return None, None, {}
+    counts = list(second_counts.values())
+    return max(counts), round(statistics.mean(counts), 2), dict(second_counts)
+
 
 def _plot_latency_scatter(metrics_list):
     """Plot latency over time (seconds from start vs scheduling latency)."""
@@ -228,18 +255,22 @@ def process_automation(uuid_fragments, no_visuals=False):
                     data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
                     dist = statistics.quantiles(lats, n=20)
                     for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
+                    # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
+                    max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
+                    data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
+                    data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
 
     # Summary Table — always printed
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
-    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Consistency (CV)':<15}")
-    print("-" * 85)
+    print(f"{'Fragment':<12} | {'Scheduler':<15} | {'Replicas':<10} | {'Avg (ms)':<10} | {'Max pods/s':<10} | {'Consistency (CV)':<15}")
+    print("-" * 100)
     for r in results:
         cv = r.get('CV', 0)
         status = "✅ Stable" if (isinstance(cv, float) and cv < 0.2) else "❌ High Var"
-        print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {cv:<15} {status}")
+        print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {cv:<15} {status}")
 
     # CSV Dump (always write to file)
     with open(OUTPUT_FILE, 'w', newline='') as f:
