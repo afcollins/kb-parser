@@ -9,6 +9,7 @@ import os
 import re
 import statistics
 import sys
+import time
 
 # Attempt to import plotille for terminal visuals
 try:
@@ -293,7 +294,12 @@ def process_automation(uuid_fragments, no_visuals=False):
                 if isinstance(m_list, list):
                     lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
                     if not no_visuals:
+                        _t0 = time.perf_counter()
                         print_visuals(m_list, pair['fragment'], data['scheduler'])
+                        _elapsed = time.perf_counter() - _t0
+                        if _elapsed > 0.5:
+                            print(f"  (built graphs in {_elapsed:.1f}s)")
+                    _t0 = time.perf_counter()
                     data['stddev'] = round(statistics.stdev(lats), 2)
                     data['Spread'] = max(lats) - min(lats)
                     data['avg'] = round(statistics.mean(lats), 2)
@@ -306,6 +312,9 @@ def process_automation(uuid_fragments, no_visuals=False):
                     max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
                     data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
                     data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
+                    _elapsed = time.perf_counter() - _t0
+                    if _elapsed > 0.5:
+                        print(f"  (crunched numbers in {_elapsed:.1f}s)")
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
@@ -363,12 +372,16 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     sorted_vals = sorted(values)
     n = len(sorted_vals)
+    _t0 = time.perf_counter()
     avg = statistics.mean(sorted_vals)
     stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
     cv = round(stdev / avg, 3) if avg else 0.0
     p50 = statistics.median(sorted_vals)
     p90 = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
     p99 = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
+    _elapsed = time.perf_counter() - _t0
+    if _elapsed > 0.5:
+        print(f"  (crunched numbers in {_elapsed:.1f}s)")
 
     print("\n\033[1;34m" + "=" * 50 + f" METRICS: {display_name} " + "=" * 50 + "\033[0m")
     print(f"  N = {n}  |  avg = {avg:.4g}  |  stdev = {stdev:.4g}  |  CV = {cv}")
@@ -378,8 +391,12 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     print("\033[1;34m" + "=" * 110 + "\033[0m")
 
     if not no_visuals and plotille:
+        _t0 = time.perf_counter()
         _plot_histogram_plotille(sorted_vals, title_suffix=title_suffix)
         _plot_cdf(sorted_vals, title_suffix=title_suffix)
+        _elapsed = time.perf_counter() - _t0
+        if _elapsed > 0.5:
+            print(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
         print("  (Use without --no-visuals to see histogram and CDF.)")
 
