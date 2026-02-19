@@ -45,12 +45,43 @@ DEFAULT_VAL = "-"
 
 def get_pretty_step(total_range_ms):
     """Returns a clean step size (1s, 2s, 5s, 10s, etc.) based on total range."""
-    # Convert range to seconds for easier logic
     range_sec = total_range_ms / 1000
     if range_sec <= 30: return 1000  # 1s
     if range_sec <= 90: return 2000  # 2s
     if range_sec <= 300: return 10000 # 10s
     return 30000 # 30s
+
+
+def match_label_filters(entry, label_filters):
+    """Return True if entry's labels match all label_filters (exact key=value)."""
+    if not label_filters:
+        return True
+    labels = entry.get("labels") or {}
+    return all(labels.get(k) == v for k, v in label_filters.items())
+
+
+def load_generic_metrics(filepath, label_filters=None):
+    """
+    Load a JSON list of metric objects (e.g. from collected-metrics), extract numeric
+    'value' for each entry. If label_filters is a dict (e.g. {"id": "/kubepods.slice"}),
+    only include entries whose labels match. Returns list of floats.
+    """
+    with open(filepath, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        data = [data]
+    values = []
+    for entry in data:
+        if "value" not in entry:
+            continue
+        if not match_label_filters(entry, label_filters):
+            continue
+        try:
+            values.append(float(entry["value"]))
+        except (TypeError, ValueError):
+            continue
+    return values
+
 
 def parse_logfmt_line(line):
     pattern = r'(\w+)=(?:\"([^\"]*)\"|(\S+))'
@@ -132,7 +163,7 @@ def _plot_latency_scatter(metrics_list):
 
 
 def _plot_frequency_histogram(sorted_lats):
-    """Plot snap-to-grid frequency histogram of scheduling latencies."""
+    """Plot snap-to-grid frequency histogram of scheduling latencies (clean ms boundaries)."""
     lats_min, lats_max = min(sorted_lats), max(sorted_lats)
     step = get_pretty_step(lats_max - lats_min)
     snapped_data = [math.floor(x / step) * step for x in sorted_lats]
@@ -151,16 +182,28 @@ def _plot_frequency_histogram(sorted_lats):
         curr += step
 
 
-def _plot_cdf(sorted_lats):
-    """Plot cumulative distribution of scheduling latencies."""
-    print("\n[ Cumulative Distribution (CDF) ]")
-    n = len(sorted_lats)
+def _plot_histogram_plotille(sorted_vals, title_suffix="", bins=20):
+    """Plot frequency histogram using plotille (for generic metric values)."""
+    if not sorted_vals:
+        return
+    title = f"[ Frequency Histogram {title_suffix} ]".strip()
+    print(f"\n{title}")
+    print(plotille.hist(sorted_vals, bins=bins))
+
+
+def _plot_cdf(sorted_vals, title_suffix=""):
+    """Plot cumulative distribution (CDF) for any sorted numeric values."""
+    if not sorted_vals:
+        return
+    title = f"[ Cumulative Distribution (CDF) {title_suffix} ]".strip()
+    print(f"\n{title}")
+    n = len(sorted_vals)
     y_vals = [i / n for i in range(n)]
     fig = plotille.Figure()
     fig.set_x_limits(min_=0)
     fig.set_y_limits(min_=0, max_=1)
     fig.width, fig.height = 70, 12
-    fig.plot(sorted_lats, y_vals)
+    fig.plot(sorted_vals, y_vals)
     print(fig.show())
 
 
@@ -296,15 +339,104 @@ def process_automation(uuid_fragments, no_visuals=False):
     console_writer.writeheader()
     console_writer.writerows(results)
 
+
+def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None, no_visuals=False):
+    """
+    Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
+    objects with 'value' and optional 'labels'. Use label_filters to restrict
+    (e.g. {"id": "/kubepods.slice", "node": "e26-h21-000-r650"}).
+    """
+    if not os.path.isfile(filepath):
+        print(f"[!] Not a file: {filepath}", file=sys.stderr)
+        return
+    values = load_generic_metrics(filepath, label_filters=label_filters)
+    if not values:
+        print(f"[!] No values found in {filepath}" + (
+            f" with label filters {label_filters}" if label_filters else ""
+        ), file=sys.stderr)
+        return
+
+    display_name = metric_name or os.path.basename(filepath)
+    title_suffix = f" — {display_name}" if display_name else ""
+    if label_filters:
+        title_suffix += " " + str(label_filters)
+
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    avg = statistics.mean(sorted_vals)
+    stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
+    cv = round(stdev / avg, 3) if avg else 0.0
+    p50 = statistics.median(sorted_vals)
+    p90 = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
+    p99 = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
+
+    print("\n\033[1;34m" + "=" * 50 + f" METRICS: {display_name} " + "=" * 50 + "\033[0m")
+    print(f"  N = {n}  |  avg = {avg:.4g}  |  stdev = {stdev:.4g}  |  CV = {cv}")
+    print(f"  min = {min(sorted_vals):.4g}  |  max = {max(sorted_vals):.4g}  |  P50 = {p50:.4g}  |  P90 = {p90:.4g}  |  P99 = {p99:.4g}")
+    if label_filters:
+        print(f"  Label filters: {label_filters}")
+    print("\033[1;34m" + "=" * 110 + "\033[0m")
+
+    if not no_visuals and plotille:
+        _plot_histogram_plotille(sorted_vals, title_suffix=title_suffix)
+        _plot_cdf(sorted_vals, title_suffix=title_suffix)
+    elif no_visuals:
+        print("  (Use without --no-visuals to see histogram and CDF.)")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parse kube-burner metrics and produce CSV reports.")
+    parser = argparse.ArgumentParser(
+        description="Parse kube-burner metrics and produce CSV reports.",
+        epilog="Run (default): %(prog)s [--no-visuals] fragment [fragment ...]  |  Metrics: %(prog)s metrics fragment [fragment ...] metric_file [--label KEY=VALUE ...] [--metric-name NAME] [--no-visuals]",
+    )
     parser.add_argument("--no-visuals", action="store_true",
                         help="Disable the large terminal plots (scatterplot, histogram, CDF) to save space.")
-    parser.add_argument("fragments", nargs="*", help="UUID fragments to search for (e.g. from collected-metrics dirs).")
-    args = parser.parse_args()
+    parser.add_argument("--metric-name", "-m", default=None, help="Display name for metric (metrics mode only; e.g. cgroupCPU).")
+    parser.add_argument("--label", "-l", action="append", metavar="KEY=VALUE",
+                        help="Filter by label in metrics mode (repeatable, e.g. -l id=/kubepods.slice).")
+    parser.add_argument("positionals", nargs="*",
+                        help="Run: UUID fragments. Metrics: 'metrics' then fragments then metric file (e.g. metrics frag1 cgroupCPU.json).")
 
-    if not args.fragments:
+    args = parser.parse_args()
+    positionals = args.positionals
+
+    # Metrics mode: first positional is "metrics"
+    if positionals and positionals[0] == "metrics":
+        if len(positionals) < 3:
+            print("metrics requires at least one fragment and a metric file (e.g. parser.py metrics frag1 cgroupCPU.json).", file=sys.stderr)
+            sys.exit(1)
+        fragments = positionals[1:-1]
+        metric_file = positionals[-1]
+        label_filters = {}
+        if getattr(args, "label", None):
+            for s in args.label:
+                if "=" in s:
+                    k, v = s.split("=", 1)
+                    label_filters[k.strip()] = v.strip()
+        discovered_pairs = find_pairs_recursively(fragments)
+        if not discovered_pairs:
+            print(f"No collected-metrics dirs found for fragments: {fragments}", file=sys.stderr)
+            sys.exit(1)
+        if not metric_file.endswith(".json"):
+            metric_file = metric_file + ".json"
+        display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
+        for pair in discovered_pairs:
+            filepath = os.path.join(pair["metrics_dir"], metric_file)
+            if not os.path.isfile(filepath):
+                print(f"[!] Not found: {filepath}", file=sys.stderr)
+                continue
+            metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
+            run_generic_metrics_analysis(
+                filepath,
+                metric_name=metric_name,
+                label_filters=label_filters or None,
+                no_visuals=args.no_visuals,
+            )
+        sys.exit(0)
+
+    # Run mode (default): all positionals are UUID fragments
+    fragments = positionals
+    if not fragments:
         parser.print_help()
         sys.exit(1)
-
-    process_automation(args.fragments, no_visuals=args.no_visuals)
+    process_automation(fragments, no_visuals=args.no_visuals)
