@@ -225,7 +225,10 @@ def process_automation(uuid_fragments, no_visuals=False):
                     'OCP Version': summary_data.get('ocpVersion', DEFAULT_VAL),
                     'scheduler': summary_data.get('scheduler', DEFAULT_VAL),
                     'podReplicas': summary_data.get('podReplicas', DEFAULT_VAL),
-                    'workers': summary_data.get('otherNodesCount', 0)
+                    'workers': summary_data.get('otherNodesCount', 0),
+                    'worker reserved cores': summary_data.get('workerReservedCores', DEFAULT_VAL),
+                    'worker CPUs': summary_data.get('workerCPUs', DEFAULT_VAL),
+                    'topologyPolicy': summary_data.get('topologyPolicy', DEFAULT_VAL)
                 })
                 job_cfg = summary_data.get('jobConfig', {})
                 data['workload'] = job_cfg.get('name', DEFAULT_VAL)
