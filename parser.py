@@ -230,6 +230,7 @@ def process_automation(uuid_fragments, no_visuals=False):
                 job_cfg = summary_data.get('jobConfig', {})
                 data['workload'] = job_cfg.get('name', DEFAULT_VAL)
                 data['iterations'] = job_cfg.get('jobIterations', 0)
+                data['qps burst'] = job_cfg.get('qps', DEFAULT_VAL)
                 churn = job_cfg.get('churnConfig', {})
                 data.update({
                     'cycles': churn.get('cycles', DEFAULT_VAL),
