@@ -112,20 +112,25 @@ def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dic
         pass
 
 
-def load_generic_metrics(filepath, label_filters=None):
+def load_generic_metrics(filepath, label_filters=None, return_entries=False):
     """
     Load a JSON list of metric objects (e.g. from collected-metrics), extract numeric
     'value' for each entry. If label_filters is a dict (e.g. {"id": "/kubepods.slice"}),
-    only include entries whose labels match. Returns list of floats.
+    only include entries whose labels match.
+
+    Returns list of floats by default. When return_entries=True, returns the list of
+    raw entry dicts (cache is bypassed for return value but still written for values).
     """
     cache_path = _cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
-    _t0 = time.perf_counter()
-    cached = _load_cache(cache_path, source_mtime)
-    _elapsed = time.perf_counter() - _t0
-    print(f"  (cache loaded in {_elapsed:.1f}s)")
-    if cached is not None:
-        return cached["values"] if isinstance(cached, dict) else cached
+
+    if not return_entries:
+        _t0 = time.perf_counter()
+        cached = _load_cache(cache_path, source_mtime)
+        _elapsed = time.perf_counter() - _t0
+        print(f"  (cache loaded in {_elapsed:.1f}s)")
+        if cached is not None:
+            return cached["values"] if isinstance(cached, dict) else cached
 
     with open(filepath, "r") as f:
         _t0 = time.perf_counter()
@@ -134,6 +139,7 @@ def load_generic_metrics(filepath, label_filters=None):
         print(f"  (raw loaded in {_elapsed:.1f}s)")
     if not isinstance(data, list):
         data = [data]
+    entries = []
     values = []
     for entry in data:
         if "value" not in entry:
@@ -141,11 +147,14 @@ def load_generic_metrics(filepath, label_filters=None):
         if not match_label_filters(entry, label_filters):
             continue
         try:
-            values.append(float(entry["value"]))
+            fval = float(entry["value"])
         except (TypeError, ValueError):
             continue
+        values.append(fval)
+        if return_entries:
+            entries.append({**entry, "value": fval})
     _save_cache(cache_path, {"values": values})
-    return values
+    return entries if return_entries else values
 
 
 def _load_lat_metrics(lat_path):
@@ -245,6 +254,55 @@ def _plot_latency_scatter(metrics_list):
     fig.set_y_limits(min_=0)
     fig.width, fig.height = 70, 12
     fig.scatter(x_secs, y_lats, lc='cyan')
+    print(fig.show())
+
+
+def analyze_label_cardinality(entries):
+    """
+    Given a list of raw metric entry dicts (each with a 'labels' key),
+    return {label_key: Counter({label_value: count, ...}), ...}.
+    Also prints a human-readable summary.
+    """
+    key_counters = defaultdict(Counter)
+    for entry in entries:
+        labels = entry.get("labels") or {}
+        for k, v in labels.items():
+            key_counters[k][v] += 1
+    n = len(entries)
+    print(f"  Labels across {n} entries:")
+    for key in sorted(key_counters):
+        counter = key_counters[key]
+        parts = ", ".join(f"{v} ({c})" for v, c in counter.most_common())
+        print(f"    {key:<12}: {parts}")
+    return dict(key_counters)
+
+
+def _plot_metrics_scatter(entries, title_suffix=""):
+    """Plot value over elapsed time for generic metric entries (timestamp + value)."""
+    data_points = []
+    for entry in entries:
+        ts_raw = entry.get("timestamp", "")
+        val = entry.get("value")
+        if not ts_raw or val is None:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
+            data_points.append((ts, float(val)))
+        except (ValueError, TypeError):
+            continue
+    if not data_points:
+        return
+    data_points.sort(key=lambda x: x[0])
+    start_t = data_points[0][0]
+    x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
+    y_vals = [p[1] for p in data_points]
+    title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
+    print(f"\n{title}")
+    fig = plotille.Figure()
+    fig.set_x_limits(min_=0)
+    fig.set_y_limits(min_=0)
+    fig.width, fig.height = 70, 12
+    fig.scatter(x_secs, y_vals, lc='cyan')
     print(fig.show())
 
 
@@ -469,7 +527,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
 
 def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
-                                  no_visuals=False, min_val=None, max_val=None):
+                                  no_visuals=False, min_val=None, max_val=None,
+                                  source=False):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -478,7 +537,16 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     if not os.path.isfile(filepath):
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
-    values = load_generic_metrics(filepath, label_filters=label_filters)
+
+    # Load raw entries when we need scatter plot or --source; otherwise use cached values.
+    need_entries = (not no_visuals and plotille) or source
+    entries = None
+    if need_entries:
+        entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
+        values = [e["value"] for e in entries]
+    else:
+        values = load_generic_metrics(filepath, label_filters=label_filters)
+
     if not values:
         print(f"[!] No values found in {filepath}" + (
             f" with label filters {label_filters}" if label_filters else ""
@@ -527,6 +595,14 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"  Label filters: {label_filters}")
     print("\033[1;34m" + "=" * 110 + "\033[0m")
 
+    # Always show label cardinality
+    if entries is not None:
+        analyze_label_cardinality(entries)
+    else:
+        # entries not loaded yet (no_visuals + no --source); load just for cardinality
+        cardinality_entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
+        analyze_label_cardinality(cardinality_entries)
+
     if not no_visuals and plotille:
         plot_vals = clip_to_range(sorted_vals, min_val, max_val)
         if not plot_vals:
@@ -535,13 +611,31 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
+            # Scatter plot: use range-filtered entries if a range is active
+            if min_val is not None or max_val is not None:
+                scatter_entries = [e for e in entries
+                                   if (min_val is None or e["value"] >= min_val)
+                                   and (max_val is None or e["value"] <= max_val)]
+            else:
+                scatter_entries = entries
+            _plot_metrics_scatter(scatter_entries, title_suffix=title_suffix)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
                 print(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
-        print("  (Use without --no-visuals to see histogram and CDF.)")
+        print("  (Use without --no-visuals to see histogram, scatter, and CDF.)")
+
+    # --source drilldown: show label breakdown + scatter for in-range entries
+    if source and (min_val is not None or max_val is not None):
+        range_entries = [e for e in (entries or [])
+                         if (min_val is None or e["value"] >= min_val)
+                         and (max_val is None or e["value"] <= max_val)]
+        print(f"\n\033[1;33m[ --source: {len(range_entries)} entries in range [{min_val}, {max_val}] ]\033[0m")
+        analyze_label_cardinality(range_entries)
+        if not no_visuals and plotille and range_entries:
+            _plot_metrics_scatter(range_entries, title_suffix=title_suffix + " [range]")
 
 
 if __name__ == "__main__":
@@ -558,6 +652,9 @@ if __name__ == "__main__":
                         help="Only plot values >= VALUE (stats use full dataset).")
     parser.add_argument("--max", "-x", type=float, default=None, metavar="VALUE",
                         help="Only plot values <= VALUE (stats use full dataset).")
+    parser.add_argument("--source", "-s", action="store_true",
+                        help="In metrics mode: when a value range is active (--min/--max/--bucket), "
+                             "show label distributions and timestamps for entries within that range.")
     parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
                         help='Plot range from histogram bucket label, e.g. --bucket "12083200, 12096000". '
                              'Overrides --min/--max if both are given.')
@@ -609,6 +706,7 @@ if __name__ == "__main__":
                 no_visuals=args.no_visuals,
                 min_val=args.min,
                 max_val=args.max,
+                source=args.source,
             )
         sys.exit(0)
 
