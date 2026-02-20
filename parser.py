@@ -549,10 +549,22 @@ if __name__ == "__main__":
                         help="Only plot values >= VALUE (stats use full dataset).")
     parser.add_argument("--max", type=float, default=None, metavar="VALUE",
                         help="Only plot values <= VALUE (stats use full dataset).")
+    parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
+                        help='Plot range from histogram bucket label, e.g. --bucket "12083200, 12096000". '
+                             'Overrides --min/--max if both are given.')
     parser.add_argument("positionals", nargs="*",
                         help="Run: UUID fragments. Metrics: 'metrics' then fragments then metric file (e.g. metrics frag1 cgroupCPU.json).")
 
     args = parser.parse_args()
+    if args.bucket is not None:
+        try:
+            parts = [p.strip().strip('[]()') for p in args.bucket.split(',')]
+            args.min = float(parts[0])
+            args.max = float(parts[1])
+        except (ValueError, IndexError):
+            print(f"[!] --bucket: expected 'MIN, MAX' (e.g. '12083200, 12096000'), got: {args.bucket!r}",
+                  file=sys.stderr)
+            sys.exit(1)
     positionals = args.positionals
 
     # Metrics mode: first positional is "metrics"
