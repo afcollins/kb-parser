@@ -120,12 +120,18 @@ def load_generic_metrics(filepath, label_filters=None):
     """
     cache_path = _cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
+    _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
+    _elapsed = time.perf_counter() - _t0
+    print(f"  (cache loaded in {_elapsed:.1f}s)")
     if cached is not None:
         return cached["values"] if isinstance(cached, dict) else cached
 
     with open(filepath, "r") as f:
+        _t0 = time.perf_counter()
         data = json.load(f)
+        _elapsed = time.perf_counter() - _t0
+        print(f"  (raw loaded in {_elapsed:.1f}s)")
     if not isinstance(data, list):
         data = [data]
     values = []
@@ -317,7 +323,10 @@ def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
 
     print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
     _plot_latency_scatter(plot_metrics)
-    _plot_frequency_histogram(plot_lats)
+    if min_val is not None or max_val is not None:
+        _plot_histogram_plotille(plot_lats, 'Scheduling Latency Zoomed')
+    else:
+        _plot_frequency_histogram(plot_lats)
     _plot_cdf(plot_lats)
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
