@@ -16,7 +16,7 @@ pip install plotille==5.0.0
 chmod +x parser.py
 ```
 
-**Run mode** (process kube-burner results by UUID fragments):
+**Latency mode** (no `metrics` keyword):
 ```bash
 ./parser.py fragment1 fragment2
 ./parser.py --min 100 --max 5000 fragment1
@@ -24,11 +24,12 @@ chmod +x parser.py
 ./parser.py --no-visuals fragment1
 ```
 
-**Metrics mode** (analyze a generic metrics JSON file):
+**Metrics mode** (include `metrics` keyword; arg order is irrelevant):
 ```bash
-./parser.py metrics fragment1 cgroupCPU.json
-./parser.py metrics fragment1 cgroupCPU.json --label id=/kubepods.slice
-./parser.py metrics fragment1 cgroupCPU.json -m "Display Name" --no-visuals
+./parser.py fragment1 metrics containerCPU
+./parser.py fragment1 metrics containerCPU cgroupCPU
+./parser.py metrics containerCPU fragment1 --label id=/kubepods.slice
+./parser.py fragment1 metrics containerCPU -m "Display Name" --no-visuals
 ```
 
 There are no automated tests. The `sample-cgroupCPU.json` file serves as example input for metrics mode.
@@ -45,9 +46,9 @@ Use these to manually verify both modes against real data in the repo:
 
 **Metrics mode:**
 ```bash
-./parser.py metrics 2178a534 containerCPU.json --no-visuals
-./parser.py metrics 2178a534 containerCPU.json
-./parser.py metrics 2178a534 containerCPU.json --top-labels 20
+./parser.py 2178a534 metrics containerCPU --no-visuals
+./parser.py 2178a534 metrics containerCPU
+./parser.py 2178a534 metrics containerCPU --top-labels 20
 ```
 
 Test data lives under directories matched by the fragment `2178a534` (collected-metrics and log file). Large test data files are excluded from Claude's context via `.claudeignore`.
@@ -56,11 +57,18 @@ Test data lives under directories matched by the fragment `2178a534` (collected-
 
 The entire implementation lives in a single file: **`parser.py`**.
 
-### Two Modes
+### Invocation
 
-1. **Run mode (default):** Recursively scans the current directory for `.log` files and `collected-metrics-<UUID>/` directories matching the given UUID fragments. Extracts scheduling latency data from `podLatencyMeasurement-*.json` and job metadata from `jobSummary.json`.
+Positionals are classified by content, not position:
+- `metrics` (literal) → enables metrics mode (latency does not run)
+- any arg matching a real `.log` / `collected-metrics-*` entry → UUID fragment
+- remaining args when `metrics` is present → metric file names
 
-2. **Metrics mode:** Loads a generic metrics JSON file (array of `{metric: {labels}, values: [[timestamp, value]]}` objects), optionally filtering by `--label KEY=VALUE` pairs.
+Classification is determined by running `find_pairs_recursively` on all non-`metrics` candidates; matched ones are UUID fragments, unmatched ones are metric file names. The caller guarantees no collision between the two sets.
+
+1. **Latency analysis:** Recursively scans the current directory for `.log` files and `collected-metrics-<UUID>/` directories matching the given UUID fragments. Extracts scheduling latency data from `podLatencyMeasurement-*.json` and job metadata from `jobSummary.json`.
+
+2. **Metrics analysis (optional):** Loads each named metrics JSON file (array of `{metric: {labels}, value}` objects) from the discovered `collected-metrics-<UUID>/` directory, optionally filtering by `--label KEY=VALUE` pairs.
 
 ### Key Data Flow
 

@@ -752,7 +752,9 @@ def _parse_bucket_arg(raw_str, flag_name):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Parse kube-burner metrics and produce CSV reports.",
-        epilog="Run (default): %(prog)s [--no-visuals] fragment [fragment ...]  |  Metrics: %(prog)s metrics fragment [fragment ...] metric_file [--label KEY=VALUE ...] [--metric-name NAME] [--no-visuals]",
+        epilog="%(prog)s UUID  — latency analysis.  "
+               "%(prog)s UUID metrics FILE ...  — metrics analysis (order of args is irrelevant). "
+               "Examples: '%(prog)s UUID' or '%(prog)s UUID metrics containerCPU cgroupCPU'",
     )
     parser.add_argument("--no-visuals", action="store_true",
                         help="Disable the large terminal plots (scatterplot, histogram, CDF) to save space.")
@@ -775,7 +777,8 @@ if __name__ == "__main__":
                         help='Filter metrics to a time window by elapsed seconds from the scatter X-axis, '
                              'e.g. --tbucket "30, 90". Analogous to --bucket for values.')
     parser.add_argument("positionals", nargs="*",
-                        help="Run: UUID fragments. Metrics: 'metrics' then fragments then metric file (e.g. metrics frag1 cgroupCPU.json).")
+                        help="UUID fragment(s) plus optional 'metrics' keyword and metric file name(s) in any order "
+                             "(e.g. '2178a534 metrics containerCPU' or 'metrics containerCPU 2178a534').")
 
     args = parser.parse_args()
     if args.bucket is not None:
@@ -786,49 +789,69 @@ if __name__ == "__main__":
         args.tmin = args.tmax = None
     positionals = args.positionals
 
-    # Metrics mode: first positional is "metrics"
-    if positionals and positionals[0] == "metrics":
-        if len(positionals) < 3:
-            print("metrics requires at least one fragment and a metric file (e.g. parser.py metrics frag1 cgroupCPU.json).", file=sys.stderr)
+    if not positionals:
+        parser.print_help()
+        sys.exit(1)
+
+    # Classify positionals:
+    #   'metrics'  → enables metrics mode
+    #   everything else → candidates (UUID fragments or metric file names)
+    # To tell UUIDs from metric files: run discovery on all candidates; anything that
+    # matches a real .log or collected-metrics-* entry is a UUID fragment, the rest are
+    # metric file names.  The caller guarantees no collision between the two sets.
+    run_metrics = "metrics" in positionals
+    candidates = [p for p in positionals if p != "metrics"]
+
+    discovered_pairs = []
+    if candidates:
+        discovered_pairs = find_pairs_recursively(candidates)
+    matched_fragments = {pair["fragment"] for pair in discovered_pairs}
+
+    fragments    = [c for c in candidates if c in matched_fragments]
+    metric_files = [c for c in candidates if c not in matched_fragments] if run_metrics else []
+
+    if not fragments and not metric_files:
+        parser.print_help()
+        sys.exit(1)
+
+    if run_metrics and not metric_files:
+        print("[!] 'metrics' requires at least one metric file name after it.", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if fragments and not run_metrics:
+        process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max)
+
+    if run_metrics and metric_files:
+        if not discovered_pairs:
+            print(f"[!] No collected-metrics dirs found — cannot locate metric files.", file=sys.stderr)
             sys.exit(1)
-        fragments = positionals[1:-1]
-        metric_file = positionals[-1]
         label_filters = {}
         if getattr(args, "label", None):
             for s in args.label:
                 if "=" in s:
                     k, v = s.split("=", 1)
                     label_filters[k.strip()] = v.strip()
-        discovered_pairs = find_pairs_recursively(fragments)
-        if not discovered_pairs:
-            print(f"No collected-metrics dirs found for fragments: {fragments}", file=sys.stderr)
-            sys.exit(1)
-        if not metric_file.endswith(".json"):
-            metric_file = metric_file + ".json"
-        display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
-        for pair in discovered_pairs:
-            filepath = os.path.join(pair["metrics_dir"], metric_file)
-            if not os.path.isfile(filepath):
-                print(f"[!] Not found: {filepath}", file=sys.stderr)
-                continue
-            metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
-            run_generic_metrics_analysis(
-                filepath,
-                metric_name=metric_name,
-                label_filters=label_filters or None,
-                no_visuals=args.no_visuals,
-                min_val=args.min,
-                max_val=args.max,
-                source=args.source,
-                tmin_sec=args.tmin,
-                tmax_sec=args.tmax,
-                top_labels=args.top_labels,
-            )
-        sys.exit(0)
-
-    # Run mode (default): all positionals are UUID fragments
-    fragments = positionals
-    if not fragments:
-        parser.print_help()
-        sys.exit(1)
-    process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max)
+        for raw_file in metric_files:
+            metric_file = raw_file if raw_file.endswith(".json") else raw_file + ".json"
+            display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
+            for pair in discovered_pairs:
+                if not pair.get("metrics_dir"):
+                    continue
+                filepath = os.path.join(pair["metrics_dir"], metric_file)
+                if not os.path.isfile(filepath):
+                    print(f"[!] Not found: {filepath}", file=sys.stderr)
+                    continue
+                metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
+                run_generic_metrics_analysis(
+                    filepath,
+                    metric_name=metric_name,
+                    label_filters=label_filters or None,
+                    no_visuals=args.no_visuals,
+                    min_val=args.min,
+                    max_val=args.max,
+                    source=args.source,
+                    tmin_sec=args.tmin,
+                    tmax_sec=args.tmax,
+                    top_labels=args.top_labels,
+                )
