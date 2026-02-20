@@ -676,10 +676,26 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                               "p50": p50, "p90": p90, "p99": p99,
                               "min": min(sorted_vals), "max": max(sorted_vals)})
 
+    # If a value range filter is active, recompute display stats on the visible subset.
+    # Cache always stores full-dataset stats; these are display-only overrides.
+    if min_val is not None or max_val is not None:
+        display_vals = clip_to_range(sorted_vals, min_val, max_val)
+        if display_vals:
+            dn    = len(display_vals)
+            n     = dn
+            avg   = statistics.mean(display_vals)
+            stdev = statistics.stdev(display_vals) if dn > 1 else 0.0
+            cv    = round(stdev / avg, 3) if avg else 0.0
+            p50   = statistics.median(display_vals)
+            p90   = statistics.quantiles(display_vals, n=10)[8] if dn >= 10 else display_vals[-1]
+            p99   = statistics.quantiles(display_vals, n=100)[98] if dn >= 100 else display_vals[-1]
+    else:
+        display_vals = sorted_vals
+
     extra = [f"Label filters: {label_filters}"] if label_filters else None
     _print_stats_table(
         f"METRICS: {display_name}", n, avg, stdev, cv, p50, p90, p99,
-        min_val=min(sorted_vals), max_val=max(sorted_vals), extra_lines=extra,
+        min_val=min(display_vals), max_val=max(display_vals), extra_lines=extra,
     )
 
     # Show label cardinality when entries are already loaded (visuals, --source, or time filter).
