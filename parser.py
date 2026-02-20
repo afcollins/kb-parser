@@ -19,6 +19,19 @@ except ImportError:
     print("[!] Run 'pip install plotille' to enable terminal graphing.")
     plotille = None
 
+# Use orjson for faster JSON parsing of large metric files when available.
+# orjson only provides loads()/dumps() (not load()/dump()), so it is used
+# only in the hot file-read path; stdlib json handles cache writes.
+try:
+    import orjson as _orjson
+    def _json_load(f):
+        return _orjson.loads(f.read())
+except ImportError:
+    print("[!] Run 'pip install orjson' for faster JSON parsing of large metric files.")
+    _orjson = None
+    def _json_load(f):
+        return json.load(f)
+
 # --- 1. DYNAMIC COLUMN CONFIGURATION ---
 # Percentiles we want to calculate
 QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
@@ -147,9 +160,9 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
         # need_labels=True, or old cache without timestamps — fall through to full parse
 
-    with open(filepath, "r") as f:
+    with open(filepath, "rb") as f:
         _t0 = time.perf_counter()
-        data = json.load(f)
+        data = _json_load(f)
         _elapsed = time.perf_counter() - _t0
         print(f"  (raw loaded in {_elapsed:.1f}s)")
     if not isinstance(data, list):
@@ -184,8 +197,8 @@ def _load_lat_metrics(lat_path):
         print(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
         return cached.get("entries", [])
 
-    with open(lat_path, 'r') as f:
-        m_list = json.load(f)
+    with open(lat_path, 'rb') as f:
+        m_list = _json_load(f)
     if not isinstance(m_list, list):
         return []
     slim = [
