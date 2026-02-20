@@ -116,25 +116,36 @@ def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dic
         pass
 
 
-def load_generic_metrics(filepath, label_filters=None, return_entries=False):
+def load_generic_metrics(filepath, label_filters=None, return_entries=False, need_labels=False):
     """
     Load a JSON list of metric objects (e.g. from collected-metrics), extract numeric
     'value' for each entry. If label_filters is a dict (e.g. {"id": "/kubepods.slice"}),
     only include entries whose labels match.
 
-    Returns list of floats by default. When return_entries=True, returns the list of
-    raw entry dicts (cache is bypassed for return value but still written for values).
+    Returns list of floats by default. When return_entries=True, returns minimal entry
+    dicts {"timestamp": ..., "value": ...} served from cache when timestamps are cached,
+    or full entry dicts (with labels) on a cold/upgraded parse.
+
+    need_labels=True forces a full parse even if timestamps are cached, so that the
+    returned entries carry their original label dicts (required for --source/-S).
     """
     cache_path = _cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
 
-    if not return_entries:
-        _t0 = time.perf_counter()
-        cached = _load_cache(cache_path, source_mtime)
-        if cached is not None:
-            _elapsed = time.perf_counter() - _t0
+    _t0 = time.perf_counter()
+    cached = _load_cache(cache_path, source_mtime)
+    if cached is not None:
+        _elapsed = time.perf_counter() - _t0
+        values = cached.get("values", [])
+        if not return_entries:
             print(f"  (cache loaded in {_elapsed:.1f}s)")
-            return cached.get("values", [])
+            return values
+        if not need_labels:
+            timestamps = cached.get("timestamps")
+            if timestamps is not None and len(timestamps) == len(values):
+                print(f"  (cache loaded in {_elapsed:.1f}s)")
+                return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
+        # need_labels=True, or old cache without timestamps — fall through to full parse
 
     with open(filepath, "r") as f:
         _t0 = time.perf_counter()
@@ -145,6 +156,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False):
         data = [data]
     entries = []
     values = []
+    timestamps = []
     for entry in data:
         if "value" not in entry:
             continue
@@ -155,9 +167,10 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False):
         except (TypeError, ValueError):
             continue
         values.append(fval)
+        timestamps.append(entry.get("timestamp", ""))
         if return_entries:
             entries.append({**entry, "value": fval})
-    _save_cache(cache_path, {"values": values})
+    _save_cache(cache_path, {"values": values, "timestamps": timestamps})
     return entries if return_entries else values
 
 
@@ -600,7 +613,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
 def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                                   no_visuals=False, min_val=None, max_val=None,
-                                  source=False, tmin_sec=None, tmax_sec=None,
+                                  scatter=False, source=False, tmin_sec=None, tmax_sec=None,
                                   top_labels=10):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
@@ -611,13 +624,15 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
 
-    # Raw entries (with timestamps) are only needed for scatter plot (--source) or time filtering.
-    # Histogram and CDF run from cached values alone, so the default path hits the cache.
-    need_entries = source or (tmin_sec is not None or tmax_sec is not None)
+    # Raw entries (with timestamps) are needed for scatter (--scatter), label source
+    # lookup (--source), or time filtering.  Histogram and CDF run from cached values
+    # alone, so the default path hits the cache without touching the source file.
+    need_entries = scatter or source or (tmin_sec is not None or tmax_sec is not None)
     entries = None
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if need_entries:
-        entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
+        entries = load_generic_metrics(filepath, label_filters=label_filters,
+                                       return_entries=True, need_labels=source)
         if tmin_sec is not None or tmax_sec is not None:
             # Compute t0 (minimum timestamp) from the full unclipped dataset so
             # the scatter X-axis preserves original elapsed seconds after clipping.
@@ -698,9 +713,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         min_val=min(display_vals), max_val=max(display_vals), extra_lines=extra,
     )
 
-    # Show label cardinality when entries are already loaded (visuals, --source, or time filter).
-    # Skipped on the cache-only path (--no-visuals without --source) to avoid forcing a raw load.
-    if entries is not None:
+    # Show label cardinality only when --source is explicitly requested.
+    # Entries reconstructed from cache carry no labels, so source lookup always
+    # forces a full parse on the first cold run.
+    if source and entries is not None:
         analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
 
     if not no_visuals and plotille:
@@ -711,7 +727,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
-            if entries is not None:
+            if scatter and entries is not None:
                 _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
@@ -719,7 +735,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if _elapsed > 0.5:
                 print(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
-        print("  (Use without --no-visuals to see histogram and CDF; add --source for scatter plot.)")
+        print("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
 
 
 
@@ -765,9 +781,12 @@ if __name__ == "__main__":
                         help="Only plot values >= VALUE (stats use full dataset).")
     parser.add_argument("--max", "-x", type=float, default=None, metavar="VALUE",
                         help="Only plot values <= VALUE (stats use full dataset).")
-    parser.add_argument("--source", "-s", action="store_true",
-                        help="In metrics mode: when a value range is active (--min/--max/--bucket), "
-                             "show label distributions and timestamps for entries within that range.")
+    parser.add_argument("--scatter", "-s", action="store_true",
+                        help="In metrics mode: render a scatter plot of value vs. elapsed time. "
+                             "Served from cache after the first run — fast for iterative drilldown.")
+    parser.add_argument("--source", "-S", action="store_true",
+                        help="In metrics mode: show label distributions for entries within the active "
+                             "value range (--min/--max/--bucket). Always reads from source file on first run.")
     parser.add_argument("--top-labels", type=int, default=10, metavar="N",
                         help="Max label values to show per key in cardinality output (default: 10).")
     parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
@@ -850,6 +869,7 @@ if __name__ == "__main__":
                     no_visuals=args.no_visuals,
                     min_val=args.min,
                     max_val=args.max,
+                    scatter=args.scatter,
                     source=args.source,
                     tmin_sec=args.tmin,
                     tmax_sec=args.tmax,
