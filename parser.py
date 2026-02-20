@@ -32,6 +32,13 @@ except ImportError:
     def _json_load(f):
         return json.load(f)
 
+# Use msgpack for binary cache files (faster reads/writes than JSON).
+try:
+    import msgpack as _msgpack
+except ImportError:
+    print("[!] Run 'pip install msgpack' for faster cache reads/writes.")
+    _msgpack = None
+
 # --- 1. DYNAMIC COLUMN CONFIGURATION ---
 # Percentiles we want to calculate
 QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
@@ -84,32 +91,52 @@ def match_label_filters(entry, label_filters):
 
 
 def _cache_path(filepath, label_filters=None):
-    """Companion cache file path alongside source."""
+    """Companion cache file path alongside source. Uses .msgpack when available."""
     base = os.path.splitext(filepath)[0]
+    ext = ".kbcache.msgpack" if _msgpack else ".kbcache.json"
     if label_filters:
         key = hashlib.md5(str(sorted(label_filters.items())).encode()).hexdigest()[:8]
-        return f"{base}_{key}.kbcache.json"
-    return f"{base}.kbcache.json"
+        return f"{base}_{key}{ext}"
+    return f"{base}{ext}"
 
 def _load_cache(cache_path, source_mtime):
-    """Return cached dict (with 'values' or 'stats' keys) or None."""
-    try:
-        if not os.path.exists(cache_path):
+    """Return cached dict (with 'values' or 'stats' keys) or None.
+    Tries cache_path first; if msgpack path not found, falls back to the
+    equivalent .kbcache.json for transparent upgrade of old caches."""
+    def _try(path):
+        try:
+            if not os.path.exists(path):
+                return None
+            if os.path.getmtime(path) < source_mtime:
+                return None
+            if path.endswith('.msgpack') and _msgpack:
+                with open(path, 'rb') as f:
+                    data = _msgpack.unpackb(f.read(), raw=False)
+            else:
+                with open(path) as f:
+                    data = json.load(f)
+            if isinstance(data, list):      # upgrade old list format
+                return {"values": data}
+            return data if isinstance(data, dict) else None
+        except Exception:
             return None
-        if os.path.getmtime(cache_path) < source_mtime:
-            return None
-        with open(cache_path) as f:
-            data = json.load(f)
-        if isinstance(data, list):          # upgrade old format
-            return {"values": data}
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+
+    result = _try(cache_path)
+    if result is not None:
+        return result
+    # Fall back to JSON counterpart so existing caches aren't discarded
+    if cache_path.endswith('.msgpack'):
+        return _try(cache_path[:-len('.msgpack')] + '.json')
+    return None
 
 def _save_cache(cache_path, data):
     try:
-        with open(cache_path, 'w') as f:
-            json.dump(data, f)
+        if cache_path.endswith('.msgpack') and _msgpack:
+            with open(cache_path, 'wb') as f:
+                f.write(_msgpack.packb(data, use_bin_type=True))
+        else:
+            with open(cache_path, 'w') as f:
+                json.dump(data, f)
     except Exception:
         pass
 
@@ -123,8 +150,7 @@ def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dic
     try:
         cache_obj = _load_cache(cache_path, source_mtime) or {values_key: values}
         cache_obj["stats"] = stats_dict
-        with open(cache_path, 'w') as f:
-            json.dump(cache_obj, f)
+        _save_cache(cache_path, cache_obj)
     except Exception:
         pass
 
@@ -181,9 +207,13 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             continue
         values.append(fval)
         timestamps.append(entry.get("timestamp", ""))
-        if return_entries:
+        if return_entries and need_labels:
             entries.append({**entry, "value": fval})
     _save_cache(cache_path, {"values": values, "timestamps": timestamps})
+    if return_entries and not need_labels:
+        # Reconstruct minimal entries from already-collected parallel arrays —
+        # avoids building 5M full entry dicts during the parse loop.
+        entries = [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
     return entries if return_entries else values
 
 
