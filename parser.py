@@ -197,12 +197,14 @@ def find_pairs_recursively(fragments):
         for frag in fragments:
             metrics_dir_name = next((d for d in dirs if 'collected-metrics' in d and frag in d), None)
             if metrics_dir_name:
+                pairs.append({
+                    'fragment': frag,
+                    'metrics_dir': os.path.join(root, metrics_dir_name)
+                })
                 log_match = next((f for f in files if frag in f and f.endswith(".log")), None)
                 if log_match:
                     pairs.append({
-                        'fragment': frag,
-                        'log_path': os.path.join(root, log_match),
-                        'metrics_dir': os.path.join(root, metrics_dir_name)
+                        'log_path': os.path.join(root, log_match)
                     })
     return pairs
 
@@ -358,6 +360,10 @@ def clip_to_range(values, min_val=None, max_val=None):
     return [v for v in values
             if (min_val is None or v >= min_val)
             and (max_val is None or v <= max_val)]
+
+def clip_entries_to_range(entries, min_val=None, max_val=None):
+    """Filter entry dicts to those whose 'value' falls in [min_val, max_val]."""
+    return [e for e in entries if clip_to_range([e["value"]], min_val, max_val)]
 
 
 def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
@@ -595,13 +601,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"  Label filters: {label_filters}")
     print("\033[1;34m" + "=" * 110 + "\033[0m")
 
-    # Always show label cardinality
-    if entries is not None:
-        analyze_label_cardinality(entries)
-    else:
-        # entries not loaded yet (no_visuals + no --source); load just for cardinality
-        cardinality_entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
-        analyze_label_cardinality(cardinality_entries)
+    # Always show label cardinality, restricted to the active value range
+    if entries is None:
+        entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
+    analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val))
 
     if not no_visuals and plotille:
         plot_vals = clip_to_range(sorted_vals, min_val, max_val)
@@ -611,14 +614,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
-            # Scatter plot: use range-filtered entries if a range is active
-            if min_val is not None or max_val is not None:
-                scatter_entries = [e for e in entries
-                                   if (min_val is None or e["value"] >= min_val)
-                                   and (max_val is None or e["value"] <= max_val)]
-            else:
-                scatter_entries = entries
-            _plot_metrics_scatter(scatter_entries, title_suffix=title_suffix)
+            _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
@@ -629,9 +625,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     # --source drilldown: show label breakdown + scatter for in-range entries
     if source and (min_val is not None or max_val is not None):
-        range_entries = [e for e in (entries or [])
-                         if (min_val is None or e["value"] >= min_val)
-                         and (max_val is None or e["value"] <= max_val)]
+        range_entries = clip_entries_to_range(entries, min_val, max_val)
         print(f"\n\033[1;33m[ --source: {len(range_entries)} entries in range [{min_val}, {max_val}] ]\033[0m")
         analyze_label_cardinality(range_entries)
         if not no_visuals and plotille and range_entries:
