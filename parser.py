@@ -45,6 +45,14 @@ DEFAULT_VAL = "-"
 
 # --- 2. HELPER FUNCTIONS ---
 
+def _parse_timestamp(ts_raw):
+    """Parse ISO timestamp string, handling 'Z' suffix. Returns datetime or None."""
+    try:
+        return datetime.datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+
+
 def get_pretty_step(total_range_ms):
     """Returns a clean step size (1s, 2s, 5s, 10s, etc.) based on total range."""
     range_sec = total_range_ms / 1000
@@ -71,14 +79,17 @@ def _cache_path(filepath, label_filters=None):
     return f"{base}.kbcache.json"
 
 def _load_cache(cache_path, source_mtime):
-    """Return cached data if cache exists and source is unchanged."""
+    """Return cached dict (with 'values' or 'stats' keys) or None."""
     try:
         if not os.path.exists(cache_path):
             return None
         if os.path.getmtime(cache_path) < source_mtime:
             return None
         with open(cache_path) as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, list):          # upgrade old format
+            return {"values": data}
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
@@ -92,19 +103,12 @@ def _save_cache(cache_path, data):
 def _get_cached_stats(cache_path, source_mtime):
     """Return pre-computed stats dict from cache if present, else None."""
     cached = _load_cache(cache_path, source_mtime)
-    if isinstance(cached, dict):
-        return cached.get("stats")
-    return None
+    return cached.get("stats") if cached else None
 
 def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dict):
-    """Persist stats into the cache file, upgrading old list format if needed."""
+    """Persist stats into the cache file."""
     try:
-        cached = _load_cache(cache_path, source_mtime)
-        if isinstance(cached, dict):
-            cache_obj = cached
-        else:
-            # Old list format or no cache yet — upgrade to dict
-            cache_obj = {values_key: cached if cached is not None else values}
+        cache_obj = _load_cache(cache_path, source_mtime) or {values_key: values}
         cache_obj["stats"] = stats_dict
         with open(cache_path, 'w') as f:
             json.dump(cache_obj, f)
@@ -127,10 +131,10 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False):
     if not return_entries:
         _t0 = time.perf_counter()
         cached = _load_cache(cache_path, source_mtime)
-        _elapsed = time.perf_counter() - _t0
-        print(f"  (cache loaded in {_elapsed:.1f}s)")
         if cached is not None:
-            return cached["values"] if isinstance(cached, dict) else cached
+            _elapsed = time.perf_counter() - _t0
+            print(f"  (cache loaded in {_elapsed:.1f}s)")
+            return cached.get("values", [])
 
     with open(filepath, "r") as f:
         _t0 = time.perf_counter()
@@ -161,9 +165,11 @@ def _load_lat_metrics(lat_path):
     """Load podLatencyMeasurement, caching [timestamp, schedulingLatency] pairs."""
     cache_path = _cache_path(lat_path)
     source_mtime = os.path.getmtime(lat_path)
+    _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
     if cached is not None:
-        return cached["entries"] if isinstance(cached, dict) else cached
+        print(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
+        return cached.get("entries", [])
 
     with open(lat_path, 'r') as f:
         m_list = json.load(f)
@@ -196,16 +202,13 @@ def find_pairs_recursively(fragments):
     for root, dirs, files in os.walk('.'):
         for frag in fragments:
             metrics_dir_name = next((d for d in dirs if 'collected-metrics' in d and frag in d), None)
-            if metrics_dir_name:
+            log_match = next((f for f in files if frag in f and f.endswith(".log")), None)
+            if metrics_dir_name or log_match:
                 pairs.append({
                     'fragment': frag,
-                    'metrics_dir': os.path.join(root, metrics_dir_name)
+                    'metrics_dir': os.path.join(root, metrics_dir_name) if metrics_dir_name else None,
+                    'log_path': os.path.join(root, log_match) if log_match else None,
                 })
-                log_match = next((f for f in files if frag in f and f.endswith(".log")), None)
-                if log_match:
-                    pairs.append({
-                        'log_path': os.path.join(root, log_match)
-                    })
     return pairs
 
 def compute_scheduling_throughput(metrics_list):
@@ -218,8 +221,10 @@ def compute_scheduling_throughput(metrics_list):
     for i in metrics_list:
         if 'timestamp' not in i or 'schedulingLatency' not in i:
             continue
+        ts = _parse_timestamp(i.get('timestamp'))
+        if ts is None:
+            continue
         try:
-            ts = datetime.datetime.fromisoformat(i['timestamp'].replace('Z', '+00:00'))
             lat_ms = int(i['schedulingLatency'])
             scheduled = ts + datetime.timedelta(milliseconds=lat_ms)
             key = scheduled.replace(microsecond=0)  # truncate to second
@@ -237,13 +242,11 @@ def _plot_latency_scatter(metrics_list):
     data_points = []
     for i in metrics_list:
         if 'timestamp' in i and 'schedulingLatency' in i:
-            # Guard: metrics may have non-ISO or malformed timestamps (e.g. empty, wrong format).
-            try:
-                ts = datetime.datetime.fromisoformat(i['timestamp'].replace('Z', '+00:00'))
-                data_points.append((ts, i['schedulingLatency']))
-            except (ValueError, TypeError) as e:
-                print(f"  [!] Skipping scatter point: invalid timestamp {i.get('timestamp', '')!r}: {e}", file=sys.stderr)
+            ts = _parse_timestamp(i['timestamp'])
+            if ts is None:
+                print(f"  [!] Skipping scatter point: invalid timestamp {i.get('timestamp', '')!r}", file=sys.stderr)
                 continue
+            data_points.append((ts, i['schedulingLatency']))
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
@@ -259,11 +262,11 @@ def _plot_latency_scatter(metrics_list):
     print(fig.show())
 
 
-def analyze_label_cardinality(entries):
+def analyze_label_cardinality(entries, top_n=10):
     """
     Given a list of raw metric entry dicts (each with a 'labels' key),
     return {label_key: Counter({label_value: count, ...}), ...}.
-    Also prints a human-readable summary.
+    Also prints a human-readable summary, capped at top_n values per label key.
     """
     key_counters = defaultdict(Counter)
     for entry in entries:
@@ -274,8 +277,11 @@ def analyze_label_cardinality(entries):
     print(f"  Labels across {n} entries:")
     for key in sorted(key_counters):
         counter = key_counters[key]
-        parts = ", ".join(f"{v} ({c})" for v, c in counter.most_common())
-        print(f"    {key:<12}: {parts}")
+        total = len(counter)
+        top = counter.most_common(top_n)
+        parts = ", ".join(f"{v} ({c})" for v, c in top)
+        suffix = f"  … +{total - top_n} more (see --top-labels)" if total > top_n else ""
+        print(f"    {key:<12}: {parts}{suffix}")
     return dict(key_counters)
 
 
@@ -292,11 +298,10 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
         val = entry.get("value")
         if not ts_raw or val is None:
             continue
-        try:
-            ts = datetime.datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
-            data_points.append((ts, float(val)))
-        except (ValueError, TypeError):
+        ts = _parse_timestamp(ts_raw)
+        if ts is None:
             continue
+        data_points.append((ts, float(val)))
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
@@ -311,6 +316,31 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
     fig.width, fig.height = 70, 12
     fig.scatter(x_secs, y_vals, lc='cyan')
     print(fig.show())
+
+
+def _print_stats_table(title, n, avg, stdev, cv, p50, p90, p99,
+                       min_val=None, max_val=None, unit="", extra_lines=None):
+    """Print a standard stats summary block.
+
+    min_val: shown when provided (metrics mode). Omitted for latency (run mode).
+    unit: appended to numeric values, e.g. 'ms'.
+    extra_lines: list of strings printed inside the box after the stat lines.
+    """
+    def fmt(v):
+        return f"{v:.4g}" if isinstance(v, (int, float)) else str(v)
+    u = unit
+    print(f"\n\033[1;34m" + "=" * 50 + f" {title} " + "=" * 50 + "\033[0m")
+    print(f"  N = {n}  |  avg = {fmt(avg)}{u}  |  stdev = {fmt(stdev)}  |  CV = {fmt(cv)}")
+    parts = []
+    if min_val is not None:
+        parts.append(f"min = {fmt(min_val)}{u}")
+    if max_val is not None:
+        parts.append(f"max = {fmt(max_val)}{u}")
+    parts += [f"P50 = {fmt(p50)}{u}", f"P90 = {fmt(p90)}{u}", f"P99 = {fmt(p99)}{u}"]
+    print("  " + "  |  ".join(parts))
+    for line in (extra_lines or []):
+        print(f"  {line}")
+    print("\033[1;34m" + "=" * 110 + "\033[0m")
 
 
 def _plot_frequency_histogram(sorted_lats):
@@ -368,7 +398,11 @@ def clip_to_range(values, min_val=None, max_val=None):
 
 def clip_entries_to_range(entries, min_val=None, max_val=None):
     """Filter entry dicts to those whose 'value' falls in [min_val, max_val]."""
-    return [e for e in entries if clip_to_range([e["value"]], min_val, max_val)]
+    if min_val is None and max_val is None:
+        return entries
+    return [e for e in entries
+            if (min_val is None or e["value"] >= min_val)
+            and (max_val is None or e["value"] <= max_val)]
 
 
 def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
@@ -378,11 +412,10 @@ def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
         return entries
     timestamps = []
     for e in entries:
-        try:
-            ts = datetime.datetime.fromisoformat(str(e.get("timestamp", "")).replace('Z', '+00:00'))
-            timestamps.append((ts, e))
-        except (ValueError, TypeError):
+        ts = _parse_timestamp(e.get("timestamp"))
+        if ts is None:
             continue
+        timestamps.append((ts, e))
     if not timestamps:
         return entries
     timestamps.sort(key=lambda x: x[0])
@@ -440,6 +473,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
         # Log Logic
         try:
+            if not pair.get('log_path'):
+                raise FileNotFoundError(f"no .log file found for fragment {pair['fragment']!r}")
             with open(pair['log_path'], 'r') as f:
                 lines = f.readlines()
                 if lines:
@@ -462,7 +497,10 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
         except Exception as e:
             print(f"  [!] Log Error: {e}")
 
-        # B. JSON Processing
+        # B. JSON Processing (only when a collected-metrics dir was found)
+        if not pair.get('metrics_dir'):
+            results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
+            continue
         summary_path = os.path.join(pair['metrics_dir'], SUMMARY_FILENAME)
         try:
             with open(summary_path, 'r') as f:
@@ -505,10 +543,10 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                 cached_stats = _get_cached_stats(cache_path, source_mtime)
                 if cached_stats:
                     data.update(cached_stats)
+                    print(f"  (stats cache loaded)")
                 else:
                     _t0 = time.perf_counter()
                     data['stddev'] = round(statistics.stdev(lats), 2)
-                    data['Spread'] = max(lats) - min(lats)
                     data['avg'] = round(statistics.mean(lats), 2)
                     data['max'] = max(lats)
                     data['CV'] = round(data['stddev'] / data['avg'], 3)
@@ -523,13 +561,20 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     if _elapsed > 0.5:
                         print(f"  (crunched numbers in {_elapsed:.1f}s)")
                     stats_to_cache = {k: data[k]
-                                      for k in (['stddev', 'Spread', 'avg', 'max', 'CV', 'sched_p90',
+                                      for k in (['stddev', 'avg', 'max', 'CV', 'sched_p90',
                                                   'max_pods_per_sec', 'avg_pods_per_sec'] + QUANTILES_HEADERS)
                                       if k in data}
                     _save_stats_to_cache(cache_path, source_mtime, "entries", m_list, stats_to_cache)
+
+                _print_stats_table(
+                    f"LATENCY STATS: {pair['fragment']}", len(lats),
+                    data.get('avg', '-'), data.get('stddev', '-'), data.get('CV', '-'),
+                    data.get('P50', '-'), data.get('P90', '-'), data.get('p99', '-'),
+                    max_val=data.get('max', '-'), unit="ms",
+                )
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
-        results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
+        results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
 
     # Summary Table — always printed
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
@@ -537,15 +582,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
     print("-" * 110)
     for r in results:
         cv = r.get('CV', 0)
-        if isinstance(cv, (int, float)):
-            if cv >= 0.8:
-                status = "🔥 Bursty (optimal)"
-            elif cv >= 0.7:
-                status = "⚠️ Likely serial - check scatterplot"
-            else:
-                status = "🐌 Serial scheduling rate"
-        else:
-            status = "—"
+        status = _classify_cv(cv)
         print(f"{str(r.get('UUID',''))[:8]:<12} | {r.get('scheduler',''):<15} | {r.get('podReplicas',''):<10} | {r.get('avg',''):<10} | {r.get('max_pods_per_sec',''):<10} | {r.get('avg_pods_per_sec',''):<10} | {cv:<15} {status}")
 
     # CSV Dump (always write to file)
@@ -563,7 +600,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
 def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                                   no_visuals=False, min_val=None, max_val=None,
-                                  source=False, tmin_sec=None, tmax_sec=None):
+                                  source=False, tmin_sec=None, tmax_sec=None,
+                                  top_labels=10):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -573,8 +611,9 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
 
-    # Always load raw entries when a time filter is active (need timestamps).
-    need_entries = (not no_visuals and plotille) or source or (tmin_sec is not None or tmax_sec is not None)
+    # Raw entries (with timestamps) are only needed for scatter plot (--source) or time filtering.
+    # Histogram and CDF run from cached values alone, so the default path hits the cache.
+    need_entries = source or (tmin_sec is not None or tmax_sec is not None)
     entries = None
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if need_entries:
@@ -582,13 +621,8 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         if tmin_sec is not None or tmax_sec is not None:
             # Compute t0 (minimum timestamp) from the full unclipped dataset so
             # the scatter X-axis preserves original elapsed seconds after clipping.
-            parsed_ts = []
-            for e in entries:
-                try:
-                    parsed_ts.append(datetime.datetime.fromisoformat(
-                        str(e.get("timestamp", "")).replace('Z', '+00:00')))
-                except (ValueError, TypeError):
-                    continue
+            parsed_ts = [ts for e in entries
+                         if (ts := _parse_timestamp(e.get("timestamp"))) is not None]
             if parsed_ts:
                 scatter_t0 = min(parsed_ts)
             original_n = len(entries)
@@ -642,17 +676,16 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                               "p50": p50, "p90": p90, "p99": p99,
                               "min": min(sorted_vals), "max": max(sorted_vals)})
 
-    print("\n\033[1;34m" + "=" * 50 + f" METRICS: {display_name} " + "=" * 50 + "\033[0m")
-    print(f"  N = {n}  |  avg = {avg:.4g}  |  stdev = {stdev:.4g}  |  CV = {cv}")
-    print(f"  min = {min(sorted_vals):.4g}  |  max = {max(sorted_vals):.4g}  |  P50 = {p50:.4g}  |  P90 = {p90:.4g}  |  P99 = {p99:.4g}")
-    if label_filters:
-        print(f"  Label filters: {label_filters}")
-    print("\033[1;34m" + "=" * 110 + "\033[0m")
+    extra = [f"Label filters: {label_filters}"] if label_filters else None
+    _print_stats_table(
+        f"METRICS: {display_name}", n, avg, stdev, cv, p50, p90, p99,
+        min_val=min(sorted_vals), max_val=max(sorted_vals), extra_lines=extra,
+    )
 
-    # Always show label cardinality, restricted to the active value range
-    if entries is None:
-        entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
-    analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val))
+    # Show label cardinality when entries are already loaded (visuals, --source, or time filter).
+    # Skipped on the cache-only path (--no-visuals without --source) to avoid forcing a raw load.
+    if entries is not None:
+        analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
 
     if not no_visuals and plotille:
         plot_vals = clip_to_range(sorted_vals, min_val, max_val)
@@ -662,22 +695,42 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
-            _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
+            if entries is not None:
+                _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
                 print(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
-        print("  (Use without --no-visuals to see histogram, scatter, and CDF.)")
+        print("  (Use without --no-visuals to see histogram and CDF; add --source for scatter plot.)")
 
-    # --source drilldown: show label breakdown + scatter for in-range entries
-    if source and (min_val is not None or max_val is not None):
-        range_entries = clip_entries_to_range(entries, min_val, max_val)
-        print(f"\n\033[1;33m[ --source: {len(range_entries)} entries in range [{min_val}, {max_val}] ]\033[0m")
-        analyze_label_cardinality(range_entries)
-        if not no_visuals and plotille and range_entries:
-            _plot_metrics_scatter(range_entries, title_suffix=title_suffix + " [range]", t0=scatter_t0)
+
+
+def _classify_cv(cv):
+    """Return a human-readable scheduling pattern label for a CV value."""
+    if not isinstance(cv, (int, float)):
+        return "—"
+    if cv >= 0.8:
+        return "🔥 Bursty (optimal)"
+    if cv >= 0.7:
+        return "⚠️ Likely serial - check scatterplot"
+    return "🐌 Serial scheduling rate"
+
+
+def _parse_bucket_arg(raw_str, flag_name):
+    """Parse 'MIN, MAX', ',MAX', or 'MIN' into (lo, hi). Exits on error."""
+    raw = raw_str.strip().strip('[]()')
+    try:
+        if ',' in raw:
+            left, right = raw.split(',', 1)
+            return (float(left.strip()) if left.strip() else None,
+                    float(right.strip()) if right.strip() else None)
+        return float(raw), None
+    except ValueError:
+        print(f"[!] --{flag_name}: expected 'MIN, MAX', ',MAX', or 'MIN', "
+              f"got: {raw_str!r}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -697,6 +750,8 @@ if __name__ == "__main__":
     parser.add_argument("--source", "-s", action="store_true",
                         help="In metrics mode: when a value range is active (--min/--max/--bucket), "
                              "show label distributions and timestamps for entries within that range.")
+    parser.add_argument("--top-labels", type=int, default=10, metavar="N",
+                        help="Max label values to show per key in cardinality output (default: 10).")
     parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
                         help='Plot range from histogram bucket label, e.g. --bucket "12083200, 12096000". '
                              'Overrides --min/--max if both are given.')
@@ -708,36 +763,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     if args.bucket is not None:
-        try:
-            raw = args.bucket.strip().strip('[]()')
-            if ',' in raw:
-                left, right = raw.split(',', 1)
-                args.min = float(left.strip()) if left.strip() else None
-                args.max = float(right.strip()) if right.strip() else None
-            else:
-                args.min = float(raw)
-                args.max = None
-        except ValueError:
-            print(f"[!] --bucket: expected 'MIN, MAX', ',MAX', or 'MIN', got: {args.bucket!r}",
-                  file=sys.stderr)
-            sys.exit(1)
+        args.min, args.max = _parse_bucket_arg(args.bucket, "bucket")
     if args.tbucket is not None:
-        try:
-            raw = args.tbucket.strip().strip('[]()')
-            if ',' in raw:
-                left, right = raw.split(',', 1)
-                args.tmin = float(left.strip()) if left.strip() else None
-                args.tmax = float(right.strip()) if right.strip() else None
-            else:
-                args.tmin = float(raw)
-                args.tmax = None
-        except ValueError:
-            print(f"[!] --tbucket: expected 'START, END', ',END', or 'START', got: {args.tbucket!r}",
-                  file=sys.stderr)
-            sys.exit(1)
+        args.tmin, args.tmax = _parse_bucket_arg(args.tbucket, "tbucket")
     else:
-        args.tmin = None
-        args.tmax = None
+        args.tmin = args.tmax = None
     positionals = args.positionals
 
     # Metrics mode: first positional is "metrics"
@@ -776,6 +806,7 @@ if __name__ == "__main__":
                 source=args.source,
                 tmin_sec=args.tmin,
                 tmax_sec=args.tmax,
+                top_labels=args.top_labels,
             )
         sys.exit(0)
 

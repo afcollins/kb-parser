@@ -33,6 +33,25 @@ chmod +x parser.py
 
 There are no automated tests. The `sample-cgroupCPU.json` file serves as example input for metrics mode.
 
+## Test Commands
+
+Use these to manually verify both modes against real data in the repo:
+
+**Run mode:**
+```bash
+./parser.py 2178a534 --no-visuals
+./parser.py 2178a534
+```
+
+**Metrics mode:**
+```bash
+./parser.py metrics 2178a534 containerCPU.json --no-visuals
+./parser.py metrics 2178a534 containerCPU.json
+./parser.py metrics 2178a534 containerCPU.json --top-labels 20
+```
+
+Test data lives under directories matched by the fragment `2178a534` (collected-metrics and log file). Large test data files are excluded from Claude's context via `.claudeignore`.
+
 ## Architecture
 
 The entire implementation lives in a single file: **`parser.py`**.
