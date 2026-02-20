@@ -279,8 +279,13 @@ def analyze_label_cardinality(entries):
     return dict(key_counters)
 
 
-def _plot_metrics_scatter(entries, title_suffix=""):
-    """Plot value over elapsed time for generic metric entries (timestamp + value)."""
+def _plot_metrics_scatter(entries, title_suffix="", t0=None):
+    """Plot value over elapsed time for generic metric entries (timestamp + value).
+
+    t0: optional datetime anchor for the X-axis origin. When provided (e.g. from
+    the full unclipped dataset), elapsed seconds are computed relative to it so
+    the X-axis position is preserved after time-range filtering.
+    """
     data_points = []
     for entry in entries:
         ts_raw = entry.get("timestamp", "")
@@ -295,13 +300,13 @@ def _plot_metrics_scatter(entries, title_suffix=""):
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
-    start_t = data_points[0][0]
+    start_t = t0 if t0 is not None else data_points[0][0]
     x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
     y_vals = [p[1] for p in data_points]
     title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
     print(f"\n{title}")
     fig = plotille.Figure()
-    fig.set_x_limits(min_=0)
+    fig.set_x_limits(min_=min(x_secs), max_=max(x_secs))
     fig.set_y_limits(min_=0)
     fig.width, fig.height = 70, 12
     fig.scatter(x_secs, y_vals, lc='cyan')
@@ -364,6 +369,30 @@ def clip_to_range(values, min_val=None, max_val=None):
 def clip_entries_to_range(entries, min_val=None, max_val=None):
     """Filter entry dicts to those whose 'value' falls in [min_val, max_val]."""
     return [e for e in entries if clip_to_range([e["value"]], min_val, max_val)]
+
+
+def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
+    """Filter entry dicts to those whose timestamp falls within [tmin_sec, tmax_sec]
+    elapsed seconds from the first timestamp in the dataset. None means no bound."""
+    if tmin_sec is None and tmax_sec is None:
+        return entries
+    timestamps = []
+    for e in entries:
+        try:
+            ts = datetime.datetime.fromisoformat(str(e.get("timestamp", "")).replace('Z', '+00:00'))
+            timestamps.append((ts, e))
+        except (ValueError, TypeError):
+            continue
+    if not timestamps:
+        return entries
+    timestamps.sort(key=lambda x: x[0])
+    start_t = timestamps[0][0]
+    result = []
+    for ts, e in timestamps:
+        elapsed = (ts - start_t).total_seconds()
+        if clip_to_range([elapsed], tmin_sec, tmax_sec):
+            result.append(e)
+    return result
 
 
 def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
@@ -534,7 +563,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
 def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                                   no_visuals=False, min_val=None, max_val=None,
-                                  source=False):
+                                  source=False, tmin_sec=None, tmax_sec=None):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -544,11 +573,30 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
 
-    # Load raw entries when we need scatter plot or --source; otherwise use cached values.
-    need_entries = (not no_visuals and plotille) or source
+    # Always load raw entries when a time filter is active (need timestamps).
+    need_entries = (not no_visuals and plotille) or source or (tmin_sec is not None or tmax_sec is not None)
     entries = None
+    scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if need_entries:
         entries = load_generic_metrics(filepath, label_filters=label_filters, return_entries=True)
+        if tmin_sec is not None or tmax_sec is not None:
+            # Compute t0 (minimum timestamp) from the full unclipped dataset so
+            # the scatter X-axis preserves original elapsed seconds after clipping.
+            parsed_ts = []
+            for e in entries:
+                try:
+                    parsed_ts.append(datetime.datetime.fromisoformat(
+                        str(e.get("timestamp", "")).replace('Z', '+00:00')))
+                except (ValueError, TypeError):
+                    continue
+            if parsed_ts:
+                scatter_t0 = min(parsed_ts)
+            original_n = len(entries)
+            entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
+            if not entries:
+                print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
+                return
+            print(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
         values = [e["value"] for e in entries]
     else:
         values = load_generic_metrics(filepath, label_filters=label_filters)
@@ -614,7 +662,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
-            _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix)
+            _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
@@ -629,7 +677,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         print(f"\n\033[1;33m[ --source: {len(range_entries)} entries in range [{min_val}, {max_val}] ]\033[0m")
         analyze_label_cardinality(range_entries)
         if not no_visuals and plotille and range_entries:
-            _plot_metrics_scatter(range_entries, title_suffix=title_suffix + " [range]")
+            _plot_metrics_scatter(range_entries, title_suffix=title_suffix + " [range]", t0=scatter_t0)
 
 
 if __name__ == "__main__":
@@ -652,19 +700,44 @@ if __name__ == "__main__":
     parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
                         help='Plot range from histogram bucket label, e.g. --bucket "12083200, 12096000". '
                              'Overrides --min/--max if both are given.')
+    parser.add_argument("--tbucket", "-t", default=None, metavar='"START_SEC, END_SEC"',
+                        help='Filter metrics to a time window by elapsed seconds from the scatter X-axis, '
+                             'e.g. --tbucket "30, 90". Analogous to --bucket for values.')
     parser.add_argument("positionals", nargs="*",
                         help="Run: UUID fragments. Metrics: 'metrics' then fragments then metric file (e.g. metrics frag1 cgroupCPU.json).")
 
     args = parser.parse_args()
     if args.bucket is not None:
         try:
-            parts = [p.strip().strip('[]()') for p in args.bucket.split(',')]
-            args.min = float(parts[0])
-            args.max = float(parts[1])
-        except (ValueError, IndexError):
-            print(f"[!] --bucket: expected 'MIN, MAX' (e.g. '12083200, 12096000'), got: {args.bucket!r}",
+            raw = args.bucket.strip().strip('[]()')
+            if ',' in raw:
+                left, right = raw.split(',', 1)
+                args.min = float(left.strip()) if left.strip() else None
+                args.max = float(right.strip()) if right.strip() else None
+            else:
+                args.min = float(raw)
+                args.max = None
+        except ValueError:
+            print(f"[!] --bucket: expected 'MIN, MAX', ',MAX', or 'MIN', got: {args.bucket!r}",
                   file=sys.stderr)
             sys.exit(1)
+    if args.tbucket is not None:
+        try:
+            raw = args.tbucket.strip().strip('[]()')
+            if ',' in raw:
+                left, right = raw.split(',', 1)
+                args.tmin = float(left.strip()) if left.strip() else None
+                args.tmax = float(right.strip()) if right.strip() else None
+            else:
+                args.tmin = float(raw)
+                args.tmax = None
+        except ValueError:
+            print(f"[!] --tbucket: expected 'START, END', ',END', or 'START', got: {args.tbucket!r}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        args.tmin = None
+        args.tmax = None
     positionals = args.positionals
 
     # Metrics mode: first positional is "metrics"
@@ -701,6 +774,8 @@ if __name__ == "__main__":
                 min_val=args.min,
                 max_val=args.max,
                 source=args.source,
+                tmin_sec=args.tmin,
+                tmax_sec=args.tmax,
             )
         sys.exit(0)
 
