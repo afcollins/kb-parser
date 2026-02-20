@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 import csv
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -61,12 +62,46 @@ def match_label_filters(entry, label_filters):
     return all(labels.get(k) == v for k, v in label_filters.items())
 
 
+def _cache_path(filepath, label_filters=None):
+    """Companion cache file path alongside source."""
+    base = os.path.splitext(filepath)[0]
+    if label_filters:
+        key = hashlib.md5(str(sorted(label_filters.items())).encode()).hexdigest()[:8]
+        return f"{base}_{key}.kbcache.json"
+    return f"{base}.kbcache.json"
+
+def _load_cache(cache_path, source_mtime):
+    """Return cached data if cache exists and source is unchanged."""
+    try:
+        if not os.path.exists(cache_path):
+            return None
+        if os.path.getmtime(cache_path) < source_mtime:
+            return None
+        with open(cache_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_cache(cache_path, data):
+    try:
+        with open(cache_path, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
 def load_generic_metrics(filepath, label_filters=None):
     """
     Load a JSON list of metric objects (e.g. from collected-metrics), extract numeric
     'value' for each entry. If label_filters is a dict (e.g. {"id": "/kubepods.slice"}),
     only include entries whose labels match. Returns list of floats.
     """
+    cache_path = _cache_path(filepath, label_filters)
+    source_mtime = os.path.getmtime(filepath)
+    cached = _load_cache(cache_path, source_mtime)
+    if cached is not None:
+        return cached
+
     with open(filepath, "r") as f:
         data = json.load(f)
     if not isinstance(data, list):
@@ -81,7 +116,29 @@ def load_generic_metrics(filepath, label_filters=None):
             values.append(float(entry["value"]))
         except (TypeError, ValueError):
             continue
+    _save_cache(cache_path, values)
     return values
+
+
+def _load_lat_metrics(lat_path):
+    """Load podLatencyMeasurement, caching [timestamp, schedulingLatency] pairs."""
+    cache_path = _cache_path(lat_path)
+    source_mtime = os.path.getmtime(lat_path)
+    cached = _load_cache(cache_path, source_mtime)
+    if cached is not None:
+        return cached
+
+    with open(lat_path, 'r') as f:
+        m_list = json.load(f)
+    if not isinstance(m_list, list):
+        return []
+    slim = [
+        {"timestamp": i["timestamp"], "schedulingLatency": i["schedulingLatency"]}
+        for i in m_list
+        if "schedulingLatency" in i and "timestamp" in i
+    ]
+    _save_cache(cache_path, slim)
+    return slim
 
 
 def parse_logfmt_line(line):
@@ -208,20 +265,41 @@ def _plot_cdf(sorted_vals, title_suffix=""):
     print(fig.show())
 
 
-def print_visuals(metrics_list, frag, scheduler):
+def clip_to_range(values, min_val=None, max_val=None):
+    """Filter values to [min_val, max_val]. None means no bound."""
+    if min_val is None and max_val is None:
+        return values
+    return [v for v in values
+            if (min_val is None or v >= min_val)
+            and (max_val is None or v <= max_val)]
+
+
+def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
     if not plotille or not isinstance(metrics_list, list):
         return
     sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
     if not sorted_lats:
         return
 
+    plot_lats = clip_to_range(sorted_lats, min_val, max_val)
+    if not plot_lats:
+        print(f"  [!] No values in range [{min_val}, {max_val}] — skipping visuals.")
+        return
+    if len(plot_lats) < len(sorted_lats):
+        print(f"  (showing {len(plot_lats)}/{len(sorted_lats)} values in [{min_val}, {max_val}]ms)")
+
+    plot_metrics = metrics_list
+    if min_val is not None or max_val is not None:
+        plot_metrics = [i for i in metrics_list
+                        if clip_to_range([i.get('schedulingLatency', 0)], min_val, max_val)]
+
     print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
-    _plot_latency_scatter(metrics_list)
-    _plot_frequency_histogram(sorted_lats)
-    _plot_cdf(sorted_lats)
+    _plot_latency_scatter(plot_metrics)
+    _plot_frequency_histogram(plot_lats)
+    _plot_cdf(plot_lats)
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
-def process_automation(uuid_fragments, no_visuals=False):
+def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None):
     if not uuid_fragments:
         print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
@@ -289,32 +367,31 @@ def process_automation(uuid_fragments, no_visuals=False):
         lat_path = os.path.join(pair['metrics_dir'], f"podLatencyMeasurement-{data['workload']}.json")
 
         try:
-            with open(lat_path, 'r') as f:
-                m_list = json.load(f)
-                if isinstance(m_list, list):
-                    lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
-                    if not no_visuals:
-                        _t0 = time.perf_counter()
-                        print_visuals(m_list, pair['fragment'], data['scheduler'])
-                        _elapsed = time.perf_counter() - _t0
-                        if _elapsed > 0.5:
-                            print(f"  (built graphs in {_elapsed:.1f}s)")
+            m_list = _load_lat_metrics(lat_path)
+            if m_list:
+                lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
+                if not no_visuals:
                     _t0 = time.perf_counter()
-                    data['stddev'] = round(statistics.stdev(lats), 2)
-                    data['Spread'] = max(lats) - min(lats)
-                    data['avg'] = round(statistics.mean(lats), 2)
-                    data['max'] = max(lats)
-                    data['CV'] = round(data['stddev'] / data['avg'], 3)
-                    data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
-                    dist = statistics.quantiles(lats, n=20)
-                    for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
-                    # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
-                    max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
-                    data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
-                    data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
+                    print_visuals(m_list, pair['fragment'], data['scheduler'], min_val=min_val, max_val=max_val)
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
-                        print(f"  (crunched numbers in {_elapsed:.1f}s)")
+                        print(f"  (built graphs in {_elapsed:.1f}s)")
+                _t0 = time.perf_counter()
+                data['stddev'] = round(statistics.stdev(lats), 2)
+                data['Spread'] = max(lats) - min(lats)
+                data['avg'] = round(statistics.mean(lats), 2)
+                data['max'] = max(lats)
+                data['CV'] = round(data['stddev'] / data['avg'], 3)
+                data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
+                dist = statistics.quantiles(lats, n=20)
+                for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
+                # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
+                max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
+                data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
+                data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
+                _elapsed = time.perf_counter() - _t0
+                if _elapsed > 0.5:
+                    print(f"  (crunched numbers in {_elapsed:.1f}s)")
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
@@ -349,7 +426,8 @@ def process_automation(uuid_fragments, no_visuals=False):
     console_writer.writerows(results)
 
 
-def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None, no_visuals=False):
+def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
+                                  no_visuals=False, min_val=None, max_val=None):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -391,12 +469,18 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     print("\033[1;34m" + "=" * 110 + "\033[0m")
 
     if not no_visuals and plotille:
-        _t0 = time.perf_counter()
-        _plot_histogram_plotille(sorted_vals, title_suffix=title_suffix)
-        _plot_cdf(sorted_vals, title_suffix=title_suffix)
-        _elapsed = time.perf_counter() - _t0
-        if _elapsed > 0.5:
-            print(f"  (built graphs in {_elapsed:.1f}s)")
+        plot_vals = clip_to_range(sorted_vals, min_val, max_val)
+        if not plot_vals:
+            print(f"  [!] No values in range [{min_val}, {max_val}]")
+        else:
+            if len(plot_vals) < len(sorted_vals):
+                print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
+            _t0 = time.perf_counter()
+            _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
+            _plot_cdf(plot_vals, title_suffix=title_suffix)
+            _elapsed = time.perf_counter() - _t0
+            if _elapsed > 0.5:
+                print(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
         print("  (Use without --no-visuals to see histogram and CDF.)")
 
@@ -411,6 +495,10 @@ if __name__ == "__main__":
     parser.add_argument("--metric-name", "-m", default=None, help="Display name for metric (metrics mode only; e.g. cgroupCPU).")
     parser.add_argument("--label", "-l", action="append", metavar="KEY=VALUE",
                         help="Filter by label in metrics mode (repeatable, e.g. -l id=/kubepods.slice).")
+    parser.add_argument("--min", type=float, default=None, metavar="VALUE",
+                        help="Only plot values >= VALUE (stats use full dataset).")
+    parser.add_argument("--max", type=float, default=None, metavar="VALUE",
+                        help="Only plot values <= VALUE (stats use full dataset).")
     parser.add_argument("positionals", nargs="*",
                         help="Run: UUID fragments. Metrics: 'metrics' then fragments then metric file (e.g. metrics frag1 cgroupCPU.json).")
 
@@ -448,6 +536,8 @@ if __name__ == "__main__":
                 metric_name=metric_name,
                 label_filters=label_filters or None,
                 no_visuals=args.no_visuals,
+                min_val=args.min,
+                max_val=args.max,
             )
         sys.exit(0)
 
@@ -456,4 +546,4 @@ if __name__ == "__main__":
     if not fragments:
         parser.print_help()
         sys.exit(1)
-    process_automation(fragments, no_visuals=args.no_visuals)
+    process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max)
