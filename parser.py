@@ -545,9 +545,9 @@ if __name__ == "__main__":
     parser.add_argument("--metric-name", "-m", default=None, help="Display name for metric (metrics mode only; e.g. cgroupCPU).")
     parser.add_argument("--label", "-l", action="append", metavar="KEY=VALUE",
                         help="Filter by label in metrics mode (repeatable, e.g. -l id=/kubepods.slice).")
-    parser.add_argument("--min", type=float, default=None, metavar="VALUE",
+    parser.add_argument("--min", "-n", type=float, default=None, metavar="VALUE",
                         help="Only plot values >= VALUE (stats use full dataset).")
-    parser.add_argument("--max", type=float, default=None, metavar="VALUE",
+    parser.add_argument("--max", "-x", type=float, default=None, metavar="VALUE",
                         help="Only plot values <= VALUE (stats use full dataset).")
     parser.add_argument("--bucket", "-b", default=None, metavar='"MIN, MAX"',
                         help='Plot range from histogram bucket label, e.g. --bucket "12083200, 12096000". '
