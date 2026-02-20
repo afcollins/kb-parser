@@ -89,6 +89,28 @@ def _save_cache(cache_path, data):
     except Exception:
         pass
 
+def _get_cached_stats(cache_path, source_mtime):
+    """Return pre-computed stats dict from cache if present, else None."""
+    cached = _load_cache(cache_path, source_mtime)
+    if isinstance(cached, dict):
+        return cached.get("stats")
+    return None
+
+def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dict):
+    """Persist stats into the cache file, upgrading old list format if needed."""
+    try:
+        cached = _load_cache(cache_path, source_mtime)
+        if isinstance(cached, dict):
+            cache_obj = cached
+        else:
+            # Old list format or no cache yet — upgrade to dict
+            cache_obj = {values_key: cached if cached is not None else values}
+        cache_obj["stats"] = stats_dict
+        with open(cache_path, 'w') as f:
+            json.dump(cache_obj, f)
+    except Exception:
+        pass
+
 
 def load_generic_metrics(filepath, label_filters=None):
     """
@@ -100,7 +122,7 @@ def load_generic_metrics(filepath, label_filters=None):
     source_mtime = os.path.getmtime(filepath)
     cached = _load_cache(cache_path, source_mtime)
     if cached is not None:
-        return cached
+        return cached["values"] if isinstance(cached, dict) else cached
 
     with open(filepath, "r") as f:
         data = json.load(f)
@@ -116,7 +138,7 @@ def load_generic_metrics(filepath, label_filters=None):
             values.append(float(entry["value"]))
         except (TypeError, ValueError):
             continue
-    _save_cache(cache_path, values)
+    _save_cache(cache_path, {"values": values})
     return values
 
 
@@ -126,7 +148,7 @@ def _load_lat_metrics(lat_path):
     source_mtime = os.path.getmtime(lat_path)
     cached = _load_cache(cache_path, source_mtime)
     if cached is not None:
-        return cached
+        return cached["entries"] if isinstance(cached, dict) else cached
 
     with open(lat_path, 'r') as f:
         m_list = json.load(f)
@@ -137,7 +159,7 @@ def _load_lat_metrics(lat_path):
         for i in m_list
         if "schedulingLatency" in i and "timestamp" in i
     ]
-    _save_cache(cache_path, slim)
+    _save_cache(cache_path, {"entries": slim})
     return slim
 
 
@@ -376,22 +398,33 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         print(f"  (built graphs in {_elapsed:.1f}s)")
-                _t0 = time.perf_counter()
-                data['stddev'] = round(statistics.stdev(lats), 2)
-                data['Spread'] = max(lats) - min(lats)
-                data['avg'] = round(statistics.mean(lats), 2)
-                data['max'] = max(lats)
-                data['CV'] = round(data['stddev'] / data['avg'], 3)
-                data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
-                dist = statistics.quantiles(lats, n=20)
-                for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
-                # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
-                max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
-                data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
-                data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
-                _elapsed = time.perf_counter() - _t0
-                if _elapsed > 0.5:
-                    print(f"  (crunched numbers in {_elapsed:.1f}s)")
+                cache_path = _cache_path(lat_path)
+                source_mtime = os.path.getmtime(lat_path)
+                cached_stats = _get_cached_stats(cache_path, source_mtime)
+                if cached_stats:
+                    data.update(cached_stats)
+                else:
+                    _t0 = time.perf_counter()
+                    data['stddev'] = round(statistics.stdev(lats), 2)
+                    data['Spread'] = max(lats) - min(lats)
+                    data['avg'] = round(statistics.mean(lats), 2)
+                    data['max'] = max(lats)
+                    data['CV'] = round(data['stddev'] / data['avg'], 3)
+                    data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
+                    dist = statistics.quantiles(lats, n=20)
+                    for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
+                    # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
+                    max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
+                    data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
+                    data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
+                    _elapsed = time.perf_counter() - _t0
+                    if _elapsed > 0.5:
+                        print(f"  (crunched numbers in {_elapsed:.1f}s)")
+                    stats_to_cache = {k: data[k]
+                                      for k in (['stddev', 'Spread', 'avg', 'max', 'CV', 'sched_p90',
+                                                  'max_pods_per_sec', 'avg_pods_per_sec'] + QUANTILES_HEADERS)
+                                      if k in data}
+                    _save_stats_to_cache(cache_path, source_mtime, "entries", m_list, stats_to_cache)
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER + ['Spread', 'CV']})
@@ -450,16 +483,33 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     sorted_vals = sorted(values)
     n = len(sorted_vals)
-    _t0 = time.perf_counter()
-    avg = statistics.mean(sorted_vals)
-    stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
-    cv = round(stdev / avg, 3) if avg else 0.0
-    p50 = statistics.median(sorted_vals)
-    p90 = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
-    p99 = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
-    _elapsed = time.perf_counter() - _t0
-    if _elapsed > 0.5:
-        print(f"  (crunched numbers in {_elapsed:.1f}s)")
+
+    cache_path = _cache_path(filepath, label_filters)
+    source_mtime = os.path.getmtime(filepath)
+    cached_stats = _get_cached_stats(cache_path, source_mtime)
+
+    if cached_stats:
+        avg   = cached_stats["avg"]
+        stdev = cached_stats["stdev"]
+        cv    = cached_stats["cv"]
+        p50   = cached_stats["p50"]
+        p90   = cached_stats["p90"]
+        p99   = cached_stats["p99"]
+    else:
+        _t0 = time.perf_counter()
+        avg   = statistics.mean(sorted_vals)
+        stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
+        cv    = round(stdev / avg, 3) if avg else 0.0
+        p50   = statistics.median(sorted_vals)
+        p90   = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
+        p99   = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
+        _elapsed = time.perf_counter() - _t0
+        if _elapsed > 0.5:
+            print(f"  (crunched numbers in {_elapsed:.1f}s)")
+        _save_stats_to_cache(cache_path, source_mtime, "values", values,
+                             {"avg": avg, "stdev": stdev, "cv": cv,
+                              "p50": p50, "p90": p90, "p99": p99,
+                              "min": min(sorted_vals), "max": max(sorted_vals)})
 
     print("\n\033[1;34m" + "=" * 50 + f" METRICS: {display_name} " + "=" * 50 + "\033[0m")
     print(f"  N = {n}  |  avg = {avg:.4g}  |  stdev = {stdev:.4g}  |  CV = {cv}")
