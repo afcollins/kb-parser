@@ -105,6 +105,10 @@ def match_label_filters(entry, label_filters):
     return all(labels.get(k) == v for k, v in label_filters.items())
 
 
+# In-process cache: avoids re-reading the same msgpack file multiple times per run.
+# Key: cache_path → value: (source_mtime_threshold, data_dict)
+_mem_cache = {}
+
 def _cache_path(filepath, label_filters=None):
     """Companion cache file path alongside source. Uses .msgpack when available."""
     base = os.path.splitext(filepath)[0]
@@ -116,8 +120,14 @@ def _cache_path(filepath, label_filters=None):
 
 def _load_cache(cache_path, source_mtime):
     """Return cached dict (with 'values' or 'stats' keys) or None.
+    Checks _mem_cache first to avoid re-reading the file within the same run.
     Tries cache_path first; if msgpack path not found, falls back to the
     equivalent .kbcache.json for transparent upgrade of old caches."""
+    # In-memory hit: same file, still valid for this source_mtime.
+    mem = _mem_cache.get(cache_path)
+    if mem is not None and mem[0] >= source_mtime:
+        return mem[1]
+
     def _try(path):
         try:
             if not os.path.exists(path):
@@ -137,12 +147,11 @@ def _load_cache(cache_path, source_mtime):
             return None
 
     result = _try(cache_path)
+    if result is None and cache_path.endswith('.msgpack'):
+        result = _try(cache_path[:-len('.msgpack')] + '.json')
     if result is not None:
-        return result
-    # Fall back to JSON counterpart so existing caches aren't discarded
-    if cache_path.endswith('.msgpack'):
-        return _try(cache_path[:-len('.msgpack')] + '.json')
-    return None
+        _mem_cache[cache_path] = (source_mtime, result)
+    return result
 
 def _save_cache(cache_path, data):
     try:
@@ -152,6 +161,8 @@ def _save_cache(cache_path, data):
         else:
             with open(cache_path, 'w') as f:
                 json.dump(data, f)
+        # Keep in-memory cache in sync so subsequent reads in this run see the update.
+        _mem_cache[cache_path] = (os.path.getmtime(cache_path), data)
     except Exception:
         pass
 
@@ -224,6 +235,11 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         timestamps.append(entry.get("timestamp", ""))
         if return_entries and need_labels:
             entries.append({**entry, "value": fval})
+    # Sort by value before caching so callers can skip sorting on cache hits.
+    # All entry consumers (scatter, clip_entries_to_time_range) re-sort by time themselves.
+    paired = sorted(zip(values, timestamps))
+    values = [p[0] for p in paired]
+    timestamps = [p[1] for p in paired]
     _save_cache(cache_path, {"values": values, "timestamps": timestamps})
     if return_entries and not need_labels:
         # Reconstruct minimal entries from already-collected parallel arrays —
@@ -720,8 +736,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         _t0 = time.perf_counter()
         values = [e["value"] for e in entries]
         _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
+        values_presorted = False  # time-filtering picks a non-contiguous subset
     else:
         values = load_generic_metrics(filepath, label_filters=label_filters)
+        values_presorted = True   # load_generic_metrics caches sorted values
 
     if not values:
         print(f"[!] No values found in {filepath}" + (
@@ -734,9 +752,13 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     if label_filters:
         title_suffix += " " + str(label_filters)
 
-    _t0 = time.perf_counter()
-    sorted_vals = sorted(values)
-    _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
+    if values_presorted:
+        sorted_vals = values
+        _debug(f"  (skipped sort — {len(sorted_vals):,} values pre-sorted from cache)")
+    else:
+        _t0 = time.perf_counter()
+        sorted_vals = sorted(values)
+        _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
     cache_path = _cache_path(filepath, label_filters)
