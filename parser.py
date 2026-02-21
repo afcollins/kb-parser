@@ -138,6 +138,14 @@ def match_label_filters(entry, label_filters):
     return all(labels.get(k) == v for k, v in label_filters.items())
 
 
+def _match_lat_filters(entry, field_filters):
+    """Return True if entry's top-level fields match all field_filters.
+    String-casts both sides so int fields (jobIteration, replica) compare cleanly."""
+    if not field_filters:
+        return True
+    return all(str(entry.get(k, "")) == str(v) for k, v in field_filters.items())
+
+
 # In-process cache: avoids re-reading the same msgpack file multiple times per run.
 # Key: cache_path → value: (source_mtime_threshold, data_dict)
 _mem_cache = {}
@@ -291,58 +299,110 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     return entries if return_entries else values
 
 
-def _load_lat_metrics(lat_path, latency_key):
+def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, max_val=None,
+                      need_full=False):
     """Load podLatencyMeasurement, caching columnar {ts, <latency_key>} arrays.
 
     Cache format: {"fields": [...], "ts": [epoch_float, ...], "<key>": [int, ...], ...}
     Keys are accumulated on demand — a new latency type triggers a targeted re-parse
     that adds only its column to the existing cache, leaving prior columns intact.
+
+    field_filters: optional dict of flat field filters (applied during parse; included
+        in the cache key so each filter combo gets its own cache file).
+    min_val/max_val: value range clip (NOT in cache key); applied in-memory on cache
+        hit, during parse on a cold path.
+    need_full: if True, always parse source and return full entry dicts (for -S).
+        Skips the columnar cache read path entirely.
     """
-    cache_path = _cache_path(lat_path)
+    cache_path = _cache_path(lat_path, field_filters)
     source_mtime = os.path.getmtime(lat_path)
     _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
 
-    if cached is not None and latency_key in cached.get("fields", []):
+    def _apply_range(entries):
+        if min_val is None and max_val is None:
+            return entries
+        return [e for e in entries
+                if (min_val is None or e[latency_key] >= min_val)
+                and (max_val is None or e[latency_key] <= max_val)]
+
+    if not need_full and cached is not None and latency_key in cached.get("fields", []):
         _info(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
         ts_arr  = cached["ts"]
         lat_arr = cached[latency_key]
-        return [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_arr, lat_arr)]
+        entries = [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_arr, lat_arr)]
+        return _apply_range(entries)
 
     def _parse_source(key):
-        """Parse source JSON, return (ts_list, value_list) for entries that have both fields."""
+        """Parse source JSON, return (ts_list, value_list) for entries that pass filters."""
         ts_out, val_out = [], []
         with open(lat_path, 'rb') as f:
             _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
             if not _ijson and not isinstance(_iter, list):
                 _iter = []
             for i in _iter:
-                if key in i and "timestamp" in i:
-                    raw_ts = i["timestamp"]
-                    epoch = raw_ts if isinstance(raw_ts, (int, float)) else (
-                        lambda dt: dt.timestamp() if dt else None
-                    )(_parse_timestamp(raw_ts))
-                    if epoch is not None:
-                        ts_out.append(epoch)
-                        val_out.append(i[key])
+                if key not in i or "timestamp" not in i:
+                    continue
+                if not _match_lat_filters(i, field_filters):
+                    continue
+                raw_ts = i["timestamp"]
+                epoch = raw_ts if isinstance(raw_ts, (int, float)) else (
+                    lambda dt: dt.timestamp() if dt else None
+                )(_parse_timestamp(raw_ts))
+                if epoch is not None:
+                    ts_out.append(epoch)
+                    val_out.append(i[key])
         return ts_out, val_out
 
-    if cached is not None and "ts" in cached:
-        # mtime still valid; column not yet cached — incremental update.
+    def _parse_source_full(key):
+        """Parse source JSON, return full entry dicts (applying field filters and value clip)."""
+        out = []
+        with open(lat_path, 'rb') as f:
+            _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
+            if not _ijson and not isinstance(_iter, list):
+                _iter = []
+            for i in _iter:
+                if key not in i or "timestamp" not in i:
+                    continue
+                if not _match_lat_filters(i, field_filters):
+                    continue
+                val = i[key]
+                if min_val is not None and val < min_val:
+                    continue
+                if max_val is not None and val > max_val:
+                    continue
+                raw_ts = i["timestamp"]
+                epoch = raw_ts if isinstance(raw_ts, (int, float)) else (
+                    lambda dt: dt.timestamp() if dt else None
+                )(_parse_timestamp(raw_ts))
+                if epoch is not None:
+                    out.append({**i, "timestamp": epoch})
+        return out
+
+    if need_full:
+        entries = _parse_source_full(latency_key)
+        _info(f"  (latency full parse in {time.perf_counter()-_t0:.1f}s)")
+        return entries
+
+    # Incremental update: cache valid, has ts column, but missing this latency key.
+    # Only attempt for unfiltered caches (filter combos always get a cold parse).
+    if not field_filters and cached is not None and "ts" in cached:
         new_ts, new_vals = _parse_source(latency_key)
         if len(new_ts) == len(cached["ts"]):
             cached[latency_key] = new_vals
             cached["fields"] = cached.get("fields", []) + [latency_key]
             _save_cache(cache_path, cached)
             _info(f"  (latency cache updated with {latency_key} in {time.perf_counter()-_t0:.1f}s)")
-            return [{"timestamp": ts, latency_key: v} for ts, v in zip(cached["ts"], new_vals)]
+            entries = [{"timestamp": ts, latency_key: v} for ts, v in zip(cached["ts"], new_vals)]
+            return _apply_range(entries)
         # Count mismatch — fall through to cold parse.
 
-    # Cold parse (mtime expired or count mismatch).
+    # Cold parse (mtime expired, count mismatch, or filtered combo not yet cached).
     ts_list, val_list = _parse_source(latency_key)
     _save_cache(cache_path, {"fields": [latency_key], "ts": ts_list, latency_key: val_list})
     _info(f"  (latency cache built in {time.perf_counter()-_t0:.1f}s)")
-    return [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_list, val_list)]
+    entries = [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_list, val_list)]
+    return _apply_range(entries)
 
 
 def parse_logfmt_line(line):
@@ -444,6 +504,56 @@ def analyze_label_cardinality(entries, top_n=10):
         suffix = f"  … +{total - top_n} more (see --top-labels)" if total > top_n else ""
         print(f"    {key:<12}: {parts}{suffix}")
     return dict(key_counters)
+
+
+# Fields to skip when enumerating latency entry keys for cardinality analysis.
+_LAT_SKIP = frozenset({"timestamp", "metricName"} | {t.value for t in LatencyType})
+
+
+def _analyze_lat_field_cardinality(entries, top_n=10):
+    """Enumerate top-level field values across latency entries, skipping latency columns.
+    Returns {field: Counter({value: count})} and prints a summary."""
+    key_counters = defaultdict(Counter)
+    for e in entries:
+        for k, v in e.items():
+            if k in _LAT_SKIP or isinstance(v, dict):
+                continue
+            key_counters[k][str(v)] += 1
+    n = len(entries)
+    print(f"  Fields across {n} entries:")
+    for key in sorted(key_counters):
+        counter = key_counters[key]
+        total = len(counter)
+        top = counter.most_common(top_n)
+        parts = ", ".join(f"{v} ({c})" for v, c in top)
+        suffix = f"  … +{total - top_n} more" if total > top_n else ""
+        print(f"    {key:<16}: {parts}{suffix}")
+    return dict(key_counters)
+
+
+def _print_cardinality(card, top_n=10):
+    """Print a cardinality dict (loaded from cache) in the same format."""
+    print(f"  Fields (from cache):")
+    for key in sorted(card):
+        counter = card[key]  # plain dict {str_val: count} from JSON/msgpack
+        total = len(counter)
+        top = sorted(counter.items(), key=lambda x: -x[1])[:top_n]
+        parts = ", ".join(f"{v} ({c})" for v, c in top)
+        suffix = f"  … +{total - top_n} more" if total > top_n else ""
+        print(f"    {key:<16}: {parts}{suffix}")
+
+
+def _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card):
+    """Persist cardinality dict into cache['cardinality'][range_key]."""
+    try:
+        cached = _load_cache(cache_path, source_mtime) or {}
+        if "cardinality" not in cached:
+            cached["cardinality"] = {}
+        # Convert Counter → plain dict for serialization
+        cached["cardinality"][range_key] = {k: dict(v) for k, v in card.items()}
+        _save_cache(cache_path, cached)
+    except Exception:
+        pass
 
 
 _SCATTER_MAX = 1_000_000  # random sample cap for scatter; full fidelity not needed at terminal res
@@ -631,7 +741,8 @@ def print_visuals(metrics_list, frag, scheduler, latency_key, min_val=None, max_
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
 def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None,
-                       latency_key="podReadyLatency"):
+                       latency_key="podReadyLatency", field_filters=None,
+                       source=False, top_labels=10):
     if not uuid_fragments:
         print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
@@ -704,19 +815,24 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
         lat_path = os.path.join(pair['metrics_dir'], f"podLatencyMeasurement-{data['workload']}.json")
 
         try:
-            m_list = _load_lat_metrics(lat_path, latency_key)
+            m_list = _load_lat_metrics(lat_path, latency_key,
+                                       field_filters=field_filters,
+                                       min_val=min_val, max_val=max_val)
             if m_list:
                 lats = sorted([i[latency_key] for i in m_list if latency_key in i])
                 if not no_visuals:
                     _t0 = time.perf_counter()
-                    print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key,
-                                  min_val=min_val, max_val=max_val)
+                    # m_list is already range-clipped; pass no min/max to avoid double-clip
+                    print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key)
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         _info(f"  (built graphs in {_elapsed:.1f}s)")
-                cache_path = _cache_path(lat_path)
+
+                # Stats cache: only for unfiltered, unconstrained runs (full dataset).
+                cache_path = _cache_path(lat_path, field_filters)
                 source_mtime = os.path.getmtime(lat_path)
-                cached_stats = _get_cached_stats(cache_path, source_mtime)
+                use_stats_cache = not field_filters and min_val is None and max_val is None
+                cached_stats = _get_cached_stats(cache_path, source_mtime) if use_stats_cache else None
                 if cached_stats:
                     data.update(cached_stats)
                     _info(f"  (stats cache loaded)")
@@ -736,11 +852,12 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         _info(f"  (crunched numbers in {_elapsed:.1f}s)")
-                    stats_to_cache = {k: data[k]
-                                      for k in (['stddev', 'avg', 'max', 'CV', 'sched_p90',
-                                                  'max_pods_per_sec', 'avg_pods_per_sec'] + QUANTILES_HEADERS)
-                                      if k in data}
-                    _save_stats_to_cache(cache_path, source_mtime, "entries", m_list, stats_to_cache)
+                    if use_stats_cache:
+                        stats_to_cache = {k: data[k]
+                                          for k in (['stddev', 'avg', 'max', 'CV', 'sched_p90',
+                                                      'max_pods_per_sec', 'avg_pods_per_sec'] + QUANTILES_HEADERS)
+                                          if k in data}
+                        _save_stats_to_cache(cache_path, source_mtime, "entries", m_list, stats_to_cache)
 
                 _print_stats_table(
                     f"LATENCY STATS: {pair['fragment']}", len(lats),
@@ -748,6 +865,23 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     data.get('P50', '-'), data.get('P90', '-'), data.get('p99', '-'),
                     max_val=data.get('max', '-'), unit="ms",
                 )
+
+            if source:
+                range_key = f"{min_val}-{max_val}"
+                cache_path_s = _cache_path(lat_path, field_filters)
+                source_mtime_s = os.path.getmtime(lat_path)
+                cached_s = _load_cache(cache_path_s, source_mtime_s) or {}
+                cached_card = cached_s.get("cardinality", {}).get(range_key)
+                if cached_card:
+                    _info("  (cardinality cache loaded)")
+                    _print_cardinality(cached_card, top_n=top_labels)
+                else:
+                    full_entries = _load_lat_metrics(lat_path, latency_key,
+                                                     field_filters=field_filters,
+                                                     min_val=min_val, max_val=max_val,
+                                                     need_full=True)
+                    card = _analyze_lat_field_cardinality(full_entries, top_n=top_labels)
+                    _merge_cardinality_to_cache(cache_path_s, source_mtime_s, range_key, card)
         except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
@@ -790,12 +924,23 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     # Raw entries (with timestamps) are needed for scatter (--scatter), label source
     # lookup (--source), or time filtering.  Histogram and CDF run from cached values
     # alone, so the default path hits the cache without touching the source file.
-    need_entries = scatter or source or (tmin_sec is not None or tmax_sec is not None)
+    cache_path = _cache_path(filepath, label_filters)
+    source_mtime = os.path.getmtime(filepath)
+
+    # Pre-check cardinality cache so we avoid forcing a cold source parse just for
+    # -S when the result is already stored.  need_labels stays False on a warm hit.
+    range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
+    cached_card = None
+    if source:
+        cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
+
+    need_labels = source and cached_card is None
+    need_entries = scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
     entries = None
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if need_entries:
         entries = load_generic_metrics(filepath, label_filters=label_filters,
-                                       return_entries=True, need_labels=source)
+                                       return_entries=True, need_labels=need_labels)
         if tmin_sec is not None or tmax_sec is not None:
             # Single pass: parse timestamps once, sort once, derive scatter_t0
             # and filter in the same loop — avoids the previous double-parse +
@@ -834,9 +979,9 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         values = [e["value"] for e in entries]
         _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
         # Pre-sorted when entries came from cache in value order (no time-filter, no
-        # --source). Time-filter picks a non-contiguous time subset; --source forces a
-        # need_labels cold parse in file order — neither is guaranteed sorted.
-        values_presorted = not source and (tmin_sec is None and tmax_sec is None)
+        # cold label parse). Time-filter picks a non-contiguous subset; a cold
+        # need_labels parse returns file order — neither is guaranteed sorted.
+        values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
     else:
         values = load_generic_metrics(filepath, label_filters=label_filters)
         values_presorted = True   # load_generic_metrics caches sorted values
@@ -861,8 +1006,6 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
-    cache_path = _cache_path(filepath, label_filters)
-    source_mtime = os.path.getmtime(filepath)
     _t0 = time.perf_counter()
     cached_stats = _get_cached_stats(cache_path, source_mtime)
     _debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
@@ -915,10 +1058,15 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     )
 
     # Show label cardinality only when --source is explicitly requested.
-    # Entries reconstructed from cache carry no labels, so source lookup always
-    # forces a full parse on the first cold run.
-    if source and entries is not None:
-        analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
+    # range_key and cached_card were computed before the load_generic_metrics call
+    # so a warm cache hit avoids re-reading the source file entirely.
+    if source:
+        if cached_card:
+            _info("  (cardinality cache loaded)")
+            _print_cardinality(cached_card, top_n=top_labels)
+        elif entries is not None:
+            card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
+            _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
 
     if not no_visuals and plotille:
         plot_vals = clip_to_range(sorted_vals, min_val, max_val)
@@ -1055,20 +1203,25 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
+    # Parse -l KEY=VALUE pairs once; used by both latency and metrics modes.
+    label_filters = {}
+    if getattr(args, "label", None):
+        for s in args.label:
+            if "=" in s:
+                k, v = s.split("=", 1)
+                label_filters[k.strip()] = v.strip()
+
     if fragments and not run_metrics:
         process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max,
-                           latency_key=args.latency_type)
+                           latency_key=args.latency_type,
+                           field_filters=label_filters or None,
+                           source=args.source,
+                           top_labels=args.top_labels)
 
     if run_metrics and metric_files:
         if not discovered_pairs:
             print(f"[!] No collected-metrics dirs found — cannot locate metric files.", file=sys.stderr)
             sys.exit(1)
-        label_filters = {}
-        if getattr(args, "label", None):
-            for s in args.label:
-                if "=" in s:
-                    k, v = s.split("=", 1)
-                    label_filters[k.strip()] = v.strip()
         for raw_file in metric_files:
             metric_file = raw_file if raw_file.endswith(".json") else raw_file + ".json"
             display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
