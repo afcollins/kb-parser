@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 import csv
 import datetime
+import enum
 import hashlib
 import json
 import math
@@ -83,6 +84,29 @@ COLUMN_ORDER = ORIGINAL_COLUMNS + QUANTILES_HEADERS + EXPERIMENTAL_COLUMNS
 SUMMARY_FILENAME = "jobSummary.json"
 OUTPUT_FILE = "kube-burner-ocp-final-report.csv"
 DEFAULT_VAL = "-"
+
+class LatencyType(enum.Enum):
+    podReadyLatency               = "podReadyLatency"
+    schedulingLatency             = "schedulingLatency"
+    initializedLatency            = "initializedLatency"
+    containersReadyLatency        = "containersReadyLatency"
+    readyToStartContainersLatency = "readyToStartContainersLatency"
+
+    def __str__(self): return self.value
+
+def _resolve_latency_type(s):
+    """Match s against LatencyType values by unambiguous prefix."""
+    matches = [t for t in LatencyType if t.value.startswith(s)]
+    if len(matches) == 1:
+        return matches[0].value
+    if len(matches) == 0:
+        choices = ", ".join(t.value for t in LatencyType)
+        raise argparse.ArgumentTypeError(
+            f"unknown latency type {s!r}. Choices: {choices}"
+        )
+    raise argparse.ArgumentTypeError(
+        f"ambiguous prefix {s!r} matches: {', '.join(t.value for t in matches)}"
+    )
 
 
 # --- 2. HELPER FUNCTIONS ---
@@ -267,26 +291,58 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     return entries if return_entries else values
 
 
-def _load_lat_metrics(lat_path):
-    """Load podLatencyMeasurement, caching [timestamp, schedulingLatency] pairs."""
+def _load_lat_metrics(lat_path, latency_key):
+    """Load podLatencyMeasurement, caching columnar {ts, <latency_key>} arrays.
+
+    Cache format: {"fields": [...], "ts": [epoch_float, ...], "<key>": [int, ...], ...}
+    Keys are accumulated on demand — a new latency type triggers a targeted re-parse
+    that adds only its column to the existing cache, leaving prior columns intact.
+    """
     cache_path = _cache_path(lat_path)
     source_mtime = os.path.getmtime(lat_path)
     _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
-    if cached is not None:
-        _info(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
-        return cached.get("entries", [])
 
-    slim = []
-    with open(lat_path, 'rb') as f:
-        _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
-        if not _ijson and not isinstance(_iter, list):
-            _iter = []
-        for i in _iter:
-            if "schedulingLatency" in i and "timestamp" in i:
-                slim.append({"timestamp": i["timestamp"], "schedulingLatency": i["schedulingLatency"]})
-    _save_cache(cache_path, {"entries": slim})
-    return slim
+    if cached is not None and latency_key in cached.get("fields", []):
+        _info(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
+        ts_arr  = cached["ts"]
+        lat_arr = cached[latency_key]
+        return [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_arr, lat_arr)]
+
+    def _parse_source(key):
+        """Parse source JSON, return (ts_list, value_list) for entries that have both fields."""
+        ts_out, val_out = [], []
+        with open(lat_path, 'rb') as f:
+            _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
+            if not _ijson and not isinstance(_iter, list):
+                _iter = []
+            for i in _iter:
+                if key in i and "timestamp" in i:
+                    raw_ts = i["timestamp"]
+                    epoch = raw_ts if isinstance(raw_ts, (int, float)) else (
+                        lambda dt: dt.timestamp() if dt else None
+                    )(_parse_timestamp(raw_ts))
+                    if epoch is not None:
+                        ts_out.append(epoch)
+                        val_out.append(i[key])
+        return ts_out, val_out
+
+    if cached is not None and "ts" in cached:
+        # mtime still valid; column not yet cached — incremental update.
+        new_ts, new_vals = _parse_source(latency_key)
+        if len(new_ts) == len(cached["ts"]):
+            cached[latency_key] = new_vals
+            cached["fields"] = cached.get("fields", []) + [latency_key]
+            _save_cache(cache_path, cached)
+            _info(f"  (latency cache updated with {latency_key} in {time.perf_counter()-_t0:.1f}s)")
+            return [{"timestamp": ts, latency_key: v} for ts, v in zip(cached["ts"], new_vals)]
+        # Count mismatch — fall through to cold parse.
+
+    # Cold parse (mtime expired or count mismatch).
+    ts_list, val_list = _parse_source(latency_key)
+    _save_cache(cache_path, {"fields": [latency_key], "ts": ts_list, latency_key: val_list})
+    _info(f"  (latency cache built in {time.perf_counter()-_t0:.1f}s)")
+    return [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_list, val_list)]
 
 
 def parse_logfmt_line(line):
@@ -316,21 +372,21 @@ def find_pairs_recursively(fragments):
                 })
     return pairs
 
-def compute_scheduling_throughput(metrics_list):
+def compute_scheduling_throughput(metrics_list, latency_key):
     """
-    Compute scheduling throughput from podLatencyMeasurement entries.
-    For each pod: scheduled_time = timestamp + schedulingLatency (ms).
+    Compute throughput from podLatencyMeasurement entries.
+    For each pod: event_time = timestamp + latency_key (ms).
     Returns (max_pods_per_sec, avg_pods_per_sec, counts_per_second).
     """
     second_counts = defaultdict(int)
     for i in metrics_list:
-        if 'timestamp' not in i or 'schedulingLatency' not in i:
+        if 'timestamp' not in i or latency_key not in i:
             continue
         ts = _parse_timestamp(i.get('timestamp'))
         if ts is None:
             continue
         try:
-            lat_ms = int(i['schedulingLatency'])
+            lat_ms = int(i[latency_key])
             scheduled = ts + datetime.timedelta(milliseconds=lat_ms)
             key = scheduled.replace(microsecond=0)  # truncate to second
             second_counts[key] += 1
@@ -342,16 +398,16 @@ def compute_scheduling_throughput(metrics_list):
     return max(counts), round(statistics.mean(counts), 2), dict(second_counts)
 
 
-def _plot_latency_scatter(metrics_list):
-    """Plot latency over time (seconds from start vs scheduling latency)."""
+def _plot_latency_scatter(metrics_list, latency_key):
+    """Plot latency over time (seconds from start vs latency value)."""
     data_points = []
     for i in metrics_list:
-        if 'timestamp' in i and 'schedulingLatency' in i:
+        if 'timestamp' in i and latency_key in i:
             ts = _parse_timestamp(i['timestamp'])
             if ts is None:
                 print(f"  [!] Skipping scatter point: invalid timestamp {i.get('timestamp', '')!r}", file=sys.stderr)
                 continue
-            data_points.append((ts, i['schedulingLatency']))
+            data_points.append((ts, i[latency_key]))
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
@@ -546,10 +602,10 @@ def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
     return result
 
 
-def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
+def print_visuals(metrics_list, frag, scheduler, latency_key, min_val=None, max_val=None):
     if not plotille or not isinstance(metrics_list, list):
         return
-    sorted_lats = sorted([i['schedulingLatency'] for i in metrics_list if 'schedulingLatency' in i])
+    sorted_lats = sorted([i[latency_key] for i in metrics_list if latency_key in i])
     if not sorted_lats:
         return
 
@@ -563,18 +619,19 @@ def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
     plot_metrics = metrics_list
     if min_val is not None or max_val is not None:
         plot_metrics = [i for i in metrics_list
-                        if clip_to_range([i.get('schedulingLatency', 0)], min_val, max_val)]
+                        if clip_to_range([i.get(latency_key, 0)], min_val, max_val)]
 
     print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
-    _plot_latency_scatter(plot_metrics)
+    _plot_latency_scatter(plot_metrics, latency_key)
     if min_val is not None or max_val is not None:
-        _plot_histogram_plotille(plot_lats, 'Scheduling Latency Zoomed')
+        _plot_histogram_plotille(plot_lats, f'{latency_key} Zoomed')
     else:
         _plot_frequency_histogram(plot_lats)
     _plot_cdf(plot_lats)
     print("\033[1;34m" + "="*70 + "\033[0m\n")
 
-def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None):
+def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None,
+                       latency_key="podReadyLatency"):
     if not uuid_fragments:
         print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
@@ -647,12 +704,13 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
         lat_path = os.path.join(pair['metrics_dir'], f"podLatencyMeasurement-{data['workload']}.json")
 
         try:
-            m_list = _load_lat_metrics(lat_path)
+            m_list = _load_lat_metrics(lat_path, latency_key)
             if m_list:
-                lats = sorted([i['schedulingLatency'] for i in m_list if 'schedulingLatency' in i])
+                lats = sorted([i[latency_key] for i in m_list if latency_key in i])
                 if not no_visuals:
                     _t0 = time.perf_counter()
-                    print_visuals(m_list, pair['fragment'], data['scheduler'], min_val=min_val, max_val=max_val)
+                    print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key,
+                                  min_val=min_val, max_val=max_val)
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         _info(f"  (built graphs in {_elapsed:.1f}s)")
@@ -671,8 +729,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     data['sched_p90'] = round(statistics.quantiles(lats, n=10)[8], 2)
                     dist = statistics.quantiles(lats, n=20)
                     for i, qh in enumerate(QUANTILES_HEADERS): data[qh] = round(dist[i], 2)
-                    # Scheduling throughput: scheduled_time = timestamp + schedulingLatency; count pods per second
-                    max_pps, avg_pps, _ = compute_scheduling_throughput(m_list)
+                    # Throughput: event_time = timestamp + latency_key; count pods per second
+                    max_pps, avg_pps, _ = compute_scheduling_throughput(m_list, latency_key)
                     data['max_pods_per_sec'] = max_pps if max_pps is not None else DEFAULT_VAL
                     data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
                     _elapsed = time.perf_counter() - _t0
@@ -938,6 +996,16 @@ if __name__ == "__main__":
     parser.add_argument("--tbucket", "-t", default=None, metavar='"START_SEC, END_SEC"',
                         help='Filter metrics to a time window by elapsed seconds from the scatter X-axis, '
                              'e.g. --tbucket "30, 90". Analogous to --bucket for values.')
+    parser.add_argument("--latency-type", "-L",
+                        type=_resolve_latency_type,
+                        default="podReadyLatency",
+                        metavar="TYPE",
+                        help=(
+                            "Latency field to analyze from podLatencyMeasurement JSON "
+                            "(unambiguous prefix accepted, e.g. -L s for schedulingLatency). "
+                            "Choices: " + ", ".join(t.value for t in LatencyType) + ". "
+                            "Default: podReadyLatency."
+                        ))
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show all timing detail including intermediate steps.")
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -988,7 +1056,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if fragments and not run_metrics:
-        process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max)
+        process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max,
+                           latency_key=args.latency_type)
 
     if run_metrics and metric_files:
         if not discovered_pairs:
