@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import statistics
 import sys
@@ -341,6 +342,10 @@ def analyze_label_cardinality(entries, top_n=10):
     return dict(key_counters)
 
 
+_SCATTER_MAX = 1_000_000  # random sample cap for scatter; full fidelity not needed at terminal res
+_CDF_MAX     = 2_000   # monotone CDF needs ~2k points for smooth 70×12 rendering
+
+
 def _plot_metrics_scatter(entries, title_suffix="", t0=None):
     """Plot value over elapsed time for generic metric entries (timestamp + value).
 
@@ -348,6 +353,9 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
     the full unclipped dataset), elapsed seconds are computed relative to it so
     the X-axis position is preserved after time-range filtering.
     """
+    n_orig = len(entries)
+    if n_orig > _SCATTER_MAX:
+        entries = random.sample(entries, _SCATTER_MAX)
     data_points = []
     for entry in entries:
         ts_raw = entry.get("timestamp", "")
@@ -366,6 +374,8 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
     y_vals = [p[1] for p in data_points]
     title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
     print(f"\n{title}")
+    if n_orig > _SCATTER_MAX:
+        print(f"  (sampled {_SCATTER_MAX:,} of {n_orig:,} points)")
     fig = plotille.Figure()
     fig.set_x_limits(min_=min(x_secs), max_=max(x_secs))
     fig.set_y_limits(min_=0)
@@ -435,6 +445,10 @@ def _plot_cdf(sorted_vals, title_suffix=""):
     title = f"[ Cumulative Distribution (CDF) {title_suffix} ]".strip()
     print(f"\n{title}")
     n = len(sorted_vals)
+    if n > _CDF_MAX:
+        step = n // _CDF_MAX
+        sorted_vals = sorted_vals[::step]
+        n = len(sorted_vals)
     y_vals = [i / n for i in range(n)]
     fig = plotille.Figure()
     fig.set_x_limits(min_=0)
