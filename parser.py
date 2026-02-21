@@ -33,6 +33,13 @@ except ImportError:
     def _json_load(f):
         return json.load(f)
 
+# Use ijson for streaming JSON parse on cold runs (lower peak memory).
+try:
+    import ijson as _ijson
+except ImportError:
+    print("[!] Run 'pip install ijson' for streaming JSON parse on cold runs (lower memory).")
+    _ijson = None
+
 # Use msgpack for binary cache files (faster reads/writes than JSON).
 try:
     import msgpack as _msgpack
@@ -222,31 +229,31 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
         # need_labels=True, or old cache without timestamps — fall through to full parse
 
-    with open(filepath, "rb") as f:
-        _t0 = time.perf_counter()
-        data = _json_load(f)
-        _elapsed = time.perf_counter() - _t0
-        _info(f"  (raw loaded in {_elapsed:.1f}s)")
-    if not isinstance(data, list):
-        data = [data]
+    _t0 = time.perf_counter()
     entries = []
     values = []
     timestamps = []
-    for entry in data:
-        if "value" not in entry:
-            continue
-        if not match_label_filters(entry, label_filters):
-            continue
-        try:
-            fval = float(entry["value"])
-        except (TypeError, ValueError):
-            continue
-        values.append(fval)
-        ts_dt = _parse_timestamp(entry.get("timestamp", ""))
-        ts_epoch = ts_dt.timestamp() if ts_dt is not None else 0.0
-        timestamps.append(ts_epoch)
-        if return_entries and need_labels:
-            entries.append({**entry, "value": fval, "timestamp": ts_epoch})
+    with open(filepath, "rb") as f:
+        _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
+        if not _ijson and not isinstance(_iter, list):
+            _iter = [_iter]
+        for entry in _iter:
+            if "value" not in entry:
+                continue
+            if not match_label_filters(entry, label_filters):
+                continue
+            try:
+                fval = float(entry["value"])
+            except (TypeError, ValueError):
+                continue
+            values.append(fval)
+            ts_dt = _parse_timestamp(entry.get("timestamp", ""))
+            ts_epoch = ts_dt.timestamp() if ts_dt is not None else 0.0
+            timestamps.append(ts_epoch)
+            if return_entries and need_labels:
+                entries.append({**entry, "value": fval, "timestamp": ts_epoch})
+    _elapsed = time.perf_counter() - _t0
+    _info(f"  (raw loaded in {_elapsed:.1f}s)")
     # Sort by value before caching so callers can skip sorting on cache hits.
     # All entry consumers (scatter, clip_entries_to_time_range) re-sort by time themselves.
     paired = sorted(zip(values, timestamps))
@@ -270,15 +277,14 @@ def _load_lat_metrics(lat_path):
         _info(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
         return cached.get("entries", [])
 
+    slim = []
     with open(lat_path, 'rb') as f:
-        m_list = _json_load(f)
-    if not isinstance(m_list, list):
-        return []
-    slim = [
-        {"timestamp": i["timestamp"], "schedulingLatency": i["schedulingLatency"]}
-        for i in m_list
-        if "schedulingLatency" in i and "timestamp" in i
-    ]
+        _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
+        if not _ijson and not isinstance(_iter, list):
+            _iter = []
+        for i in _iter:
+            if "schedulingLatency" in i and "timestamp" in i:
+                slim.append({"timestamp": i["timestamp"], "schedulingLatency": i["schedulingLatency"]})
     _save_cache(cache_path, {"entries": slim})
     return slim
 
