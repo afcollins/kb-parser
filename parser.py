@@ -81,7 +81,9 @@ DEFAULT_VAL = "-"
 # --- 2. HELPER FUNCTIONS ---
 
 def _parse_timestamp(ts_raw):
-    """Parse ISO timestamp string, handling 'Z' suffix. Returns datetime or None."""
+    """Parse ISO timestamp string (or epoch float) to datetime. Returns None on failure."""
+    if isinstance(ts_raw, (int, float)):
+        return datetime.datetime.fromtimestamp(ts_raw, tz=datetime.timezone.utc)
     try:
         return datetime.datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
     except (ValueError, TypeError):
@@ -208,6 +210,14 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         if not need_labels:
             timestamps = cached.get("timestamps")
             if timestamps is not None and len(timestamps) == len(values):
+                # One-time migration: convert legacy string timestamps to epoch floats.
+                if timestamps and isinstance(timestamps[0], str):
+                    _debug(f"  (migrating {len(timestamps):,} string timestamps to epoch floats)")
+                    timestamps = [
+                        (dt.timestamp() if (dt := _parse_timestamp(ts)) is not None else 0.0)
+                        for ts in timestamps
+                    ]
+                    _save_cache(cache_path, {**cached, "timestamps": timestamps})
                 _info(f"  (cache loaded in {_elapsed:.1f}s)")
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
         # need_labels=True, or old cache without timestamps — fall through to full parse
@@ -232,9 +242,11 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         except (TypeError, ValueError):
             continue
         values.append(fval)
-        timestamps.append(entry.get("timestamp", ""))
+        ts_dt = _parse_timestamp(entry.get("timestamp", ""))
+        ts_epoch = ts_dt.timestamp() if ts_dt is not None else 0.0
+        timestamps.append(ts_epoch)
         if return_entries and need_labels:
-            entries.append({**entry, "value": fval})
+            entries.append({**entry, "value": fval, "timestamp": ts_epoch})
     # Sort by value before caching so callers can skip sorting on cache hits.
     # All entry consumers (scatter, clip_entries_to_time_range) re-sort by time themselves.
     paired = sorted(zip(values, timestamps))
@@ -721,14 +733,35 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         entries = load_generic_metrics(filepath, label_filters=label_filters,
                                        return_entries=True, need_labels=source)
         if tmin_sec is not None or tmax_sec is not None:
-            # Compute t0 (minimum timestamp) from the full unclipped dataset so
-            # the scatter X-axis preserves original elapsed seconds after clipping.
-            parsed_ts = [ts for e in entries
-                         if (ts := _parse_timestamp(e.get("timestamp"))) is not None]
-            if parsed_ts:
-                scatter_t0 = min(parsed_ts)
+            # Single pass: parse timestamps once, sort once, derive scatter_t0
+            # and filter in the same loop — avoids the previous double-parse +
+            # redundant sort inside clip_entries_to_time_range.
             original_n = len(entries)
-            entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
+            _t0 = time.perf_counter()
+            # Extract timestamps as a flat float list — no tuple allocation, no sort.
+            # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
+            # Fall back to _parse_timestamp only for legacy string-timestamp caches.
+            first_ts = entries[0].get("timestamp") if entries else None
+            if isinstance(first_ts, (int, float)):
+                ts_list = [e["timestamp"] for e in entries]
+            else:
+                ts_list = [
+                    (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
+                    for e in entries
+                ]
+            _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
+            _t0 = time.perf_counter()
+            if ts_list:
+                t0_epoch = min(ts_list)
+                scatter_t0 = datetime.datetime.fromtimestamp(t0_epoch, tz=datetime.timezone.utc)
+                entries = [
+                    e for e, ts in zip(entries, ts_list)
+                    if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
+                    and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
+                ]
+            else:
+                entries = []
+            _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
             if not entries:
                 print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
                 return
@@ -736,7 +769,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         _t0 = time.perf_counter()
         values = [e["value"] for e in entries]
         _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
-        values_presorted = False  # time-filtering picks a non-contiguous subset
+        # Pre-sorted when entries came from cache in value order (no time-filter, no
+        # --source). Time-filter picks a non-contiguous time subset; --source forces a
+        # need_labels cold parse in file order — neither is guaranteed sorted.
+        values_presorted = not source and (tmin_sec is None and tmax_sec is None)
     else:
         values = load_generic_metrics(filepath, label_filters=label_filters)
         values_presorted = True   # load_generic_metrics caches sorted values
