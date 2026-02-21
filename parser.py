@@ -40,6 +40,20 @@ except ImportError:
     print("[!] Run 'pip install msgpack' for faster cache reads/writes.")
     _msgpack = None
 
+# Logging verbosity — set from CLI args in __main__.
+_verbose = False
+_quiet   = False
+
+def _info(msg):
+    """Diagnostic/timing print. Shown by default; suppressed by --quiet."""
+    if not _quiet:
+        print(msg)
+
+def _debug(msg):
+    """Verbose detail. Only shown with --verbose."""
+    if _verbose:
+        print(msg)
+
 # --- 1. DYNAMIC COLUMN CONFIGURATION ---
 # Percentiles we want to calculate
 QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
@@ -178,12 +192,12 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         _elapsed = time.perf_counter() - _t0
         values = cached.get("values", [])
         if not return_entries:
-            print(f"  (cache loaded in {_elapsed:.1f}s)")
+            _info(f"  (cache loaded in {_elapsed:.1f}s)")
             return values
         if not need_labels:
             timestamps = cached.get("timestamps")
             if timestamps is not None and len(timestamps) == len(values):
-                print(f"  (cache loaded in {_elapsed:.1f}s)")
+                _info(f"  (cache loaded in {_elapsed:.1f}s)")
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
         # need_labels=True, or old cache without timestamps — fall through to full parse
 
@@ -191,7 +205,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         _t0 = time.perf_counter()
         data = _json_load(f)
         _elapsed = time.perf_counter() - _t0
-        print(f"  (raw loaded in {_elapsed:.1f}s)")
+        _info(f"  (raw loaded in {_elapsed:.1f}s)")
     if not isinstance(data, list):
         data = [data]
     entries = []
@@ -225,7 +239,7 @@ def _load_lat_metrics(lat_path):
     _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
     if cached is not None:
-        print(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
+        _info(f"  (latency cache loaded in {time.perf_counter() - _t0:.1f}s)")
         return cached.get("entries", [])
 
     with open(lat_path, 'rb') as f:
@@ -375,7 +389,7 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
     title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
     print(f"\n{title}")
     if n_orig > _SCATTER_MAX:
-        print(f"  (sampled {_SCATTER_MAX:,} of {n_orig:,} points)")
+        _info(f"  (sampled {_SCATTER_MAX:,} of {n_orig:,} points)")
     fig = plotille.Figure()
     fig.set_x_limits(min_=min(x_secs), max_=max(x_secs))
     fig.set_y_limits(min_=0)
@@ -510,7 +524,7 @@ def print_visuals(metrics_list, frag, scheduler, min_val=None, max_val=None):
         print(f"  [!] No values in range [{min_val}, {max_val}] — skipping visuals.")
         return
     if len(plot_lats) < len(sorted_lats):
-        print(f"  (showing {len(plot_lats)}/{len(sorted_lats)} values in [{min_val}, {max_val}]ms)")
+        _info(f"  (showing {len(plot_lats)}/{len(sorted_lats)} values in [{min_val}, {max_val}]ms)")
 
     plot_metrics = metrics_list
     if min_val is not None or max_val is not None:
@@ -607,13 +621,13 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     print_visuals(m_list, pair['fragment'], data['scheduler'], min_val=min_val, max_val=max_val)
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
-                        print(f"  (built graphs in {_elapsed:.1f}s)")
+                        _info(f"  (built graphs in {_elapsed:.1f}s)")
                 cache_path = _cache_path(lat_path)
                 source_mtime = os.path.getmtime(lat_path)
                 cached_stats = _get_cached_stats(cache_path, source_mtime)
                 if cached_stats:
                     data.update(cached_stats)
-                    print(f"  (stats cache loaded)")
+                    _info(f"  (stats cache loaded)")
                 else:
                     _t0 = time.perf_counter()
                     data['stddev'] = round(statistics.stdev(lats), 2)
@@ -629,7 +643,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     data['avg_pods_per_sec'] = avg_pps if avg_pps is not None else DEFAULT_VAL
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
-                        print(f"  (crunched numbers in {_elapsed:.1f}s)")
+                        _info(f"  (crunched numbers in {_elapsed:.1f}s)")
                     stats_to_cache = {k: data[k]
                                       for k in (['stddev', 'avg', 'max', 'CV', 'sched_p90',
                                                   'max_pods_per_sec', 'avg_pods_per_sec'] + QUANTILES_HEADERS)
@@ -702,8 +716,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if not entries:
                 print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
                 return
-            print(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
+            _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
+        _t0 = time.perf_counter()
         values = [e["value"] for e in entries]
+        _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
     else:
         values = load_generic_metrics(filepath, label_filters=label_filters)
 
@@ -718,12 +734,16 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     if label_filters:
         title_suffix += " " + str(label_filters)
 
+    _t0 = time.perf_counter()
     sorted_vals = sorted(values)
+    _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
     cache_path = _cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
+    _t0 = time.perf_counter()
     cached_stats = _get_cached_stats(cache_path, source_mtime)
+    _debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
 
     if cached_stats:
         avg   = cached_stats["avg"]
@@ -742,11 +762,13 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         p99   = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
         _elapsed = time.perf_counter() - _t0
         if _elapsed > 0.5:
-            print(f"  (crunched numbers in {_elapsed:.1f}s)")
+            _info(f"  (crunched numbers in {_elapsed:.1f}s)")
+        _t0 = time.perf_counter()
         _save_stats_to_cache(cache_path, source_mtime, "values", values,
                              {"avg": avg, "stdev": stdev, "cv": cv,
                               "p50": p50, "p90": p90, "p99": p99,
                               "min": min(sorted_vals), "max": max(sorted_vals)})
+        _debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
 
     # If a value range filter is active, recompute display stats on the visible subset.
     # Cache always stores full-dataset stats; these are display-only overrides.
@@ -782,7 +804,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             print(f"  [!] No values in range [{min_val}, {max_val}]")
         else:
             if len(plot_vals) < len(sorted_vals):
-                print(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
+                _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
             if scatter and entries is not None:
                 _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
@@ -790,9 +812,9 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
-                print(f"  (built graphs in {_elapsed:.1f}s)")
+                _info(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
-        print("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
+        _info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
 
 
 
@@ -852,11 +874,17 @@ if __name__ == "__main__":
     parser.add_argument("--tbucket", "-t", default=None, metavar='"START_SEC, END_SEC"',
                         help='Filter metrics to a time window by elapsed seconds from the scatter X-axis, '
                              'e.g. --tbucket "30, 90". Analogous to --bucket for values.')
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show all timing detail including intermediate steps.")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress all diagnostic output; show only stats tables and graphs.")
     parser.add_argument("positionals", nargs="*",
                         help="UUID fragment(s) plus optional 'metrics' keyword and metric file name(s) in any order "
                              "(e.g. '2178a534 metrics containerCPU' or 'metrics containerCPU 2178a534').")
 
     args = parser.parse_args()
+    _verbose = args.verbose
+    _quiet   = args.quiet and not args.verbose
     if args.bucket is not None:
         args.min, args.max = _parse_bucket_arg(args.bucket, "bucket")
     if args.tbucket is not None:
