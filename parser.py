@@ -458,7 +458,7 @@ def compute_scheduling_throughput(metrics_list, latency_key):
     return max(counts), round(statistics.mean(counts), 2), dict(second_counts)
 
 
-def _plot_latency_scatter(metrics_list, latency_key):
+def _plot_latency_scatter(metrics_list, latency_key, min_y=0):
     """Plot latency over time (seconds from start vs latency value)."""
     data_points = []
     for i in metrics_list:
@@ -476,8 +476,8 @@ def _plot_latency_scatter(metrics_list, latency_key):
     y_lats = [p[1] for p in data_points]
     print("\n[ Latency Scatterplot (Time vs. Delay) ]")
     fig = plotille.Figure()
-    fig.set_x_limits(min_=0)
-    fig.set_y_limits(min_=0)
+    fig.set_x_limits(min_=min(x_secs), max_=max(x_secs))
+    fig.set_y_limits(min_=min_y)
     fig.width, fig.height = 70, 12
     fig.scatter(x_secs, y_lats, lc='cyan')
     print(fig.show())
@@ -560,7 +560,7 @@ _SCATTER_MAX = 1_000_000  # random sample cap for scatter; full fidelity not nee
 _CDF_MAX     = 2_000   # monotone CDF needs ~2k points for smooth 70×12 rendering
 
 
-def _plot_metrics_scatter(entries, title_suffix="", t0=None):
+def _plot_metrics_scatter(entries, title_suffix="", t0=None, min_val=0):
     """Plot value over elapsed time for generic metric entries (timestamp + value).
 
     t0: optional datetime anchor for the X-axis origin. When provided (e.g. from
@@ -592,7 +592,7 @@ def _plot_metrics_scatter(entries, title_suffix="", t0=None):
         _info(f"  (sampled {_SCATTER_MAX:,} of {n_orig:,} points)")
     fig = plotille.Figure()
     fig.set_x_limits(min_=min(x_secs), max_=max(x_secs))
-    fig.set_y_limits(min_=0)
+    fig.set_y_limits(min_=min_val)
     fig.width, fig.height = 70, 12
     fig.scatter(x_secs, y_vals, lc='cyan')
     print(fig.show())
@@ -665,7 +665,7 @@ def _plot_cdf(sorted_vals, title_suffix=""):
         n = len(sorted_vals)
     y_vals = [i / n for i in range(n)]
     fig = plotille.Figure()
-    fig.set_x_limits(min_=0)
+    fig.set_x_limits(min_=min(sorted_vals))
     fig.set_y_limits(min_=0, max_=1)
     fig.width, fig.height = 70, 12
     fig.plot(sorted_vals, y_vals)
@@ -732,7 +732,7 @@ def print_visuals(metrics_list, frag, scheduler, latency_key, min_val=None, max_
                         if clip_to_range([i.get(latency_key, 0)], min_val, max_val)]
 
     print(f"\n\033[1;34m" + "="*25 + f" VISUALS: {scheduler} {frag} " + "="*25 + "\033[0m")
-    _plot_latency_scatter(plot_metrics, latency_key)
+    _plot_latency_scatter(plot_metrics, latency_key, min_y=min_val)
     if min_val is not None or max_val is not None:
         _plot_histogram_plotille(plot_lats, f'{latency_key} Zoomed')
     else:
@@ -1077,7 +1077,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
             if scatter and entries is not None:
-                _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0)
+                _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0, min_val=min_val)
             _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
             _plot_cdf(plot_vals, title_suffix=title_suffix)
             _elapsed = time.perf_counter() - _t0
