@@ -150,12 +150,19 @@ def _match_lat_filters(entry, field_filters):
 # Key: cache_path → value: (source_mtime_threshold, data_dict)
 _mem_cache = {}
 
-def _cache_path(filepath, label_filters=None):
+def _cache_path(filepath, label_filters=None, latency_key=None):
     """Companion cache file path alongside source. Uses .msgpack when available."""
     base = os.path.splitext(filepath)[0]
     ext = ".kbcache.msgpack" if _msgpack else ".kbcache.json"
-    if label_filters:
+    # TODO refactor. Cheap, ugly.
+    if label_filters and latency_key:
+        key = hashlib.md5(str(sorted(label_filters.items()) + latency_key).encode()).hexdigest()[:8]
+        return f"{base}_{key}{ext}"
+    elif label_filters:
         key = hashlib.md5(str(sorted(label_filters.items())).encode()).hexdigest()[:8]
+        return f"{base}_{key}{ext}"
+    elif latency_key:
+        key = hashlib.md5(str(latency_key).encode()).hexdigest()[:8]
         return f"{base}_{key}{ext}"
     return f"{base}{ext}"
 
@@ -314,7 +321,8 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
     need_full: if True, always parse source and return full entry dicts (for -S).
         Skips the columnar cache read path entirely.
     """
-    cache_path = _cache_path(lat_path, field_filters)
+    # TODO Add latency_key as a field filter.
+    cache_path = _cache_path(lat_path, field_filters, latency_key)
     source_mtime = os.path.getmtime(lat_path)
     _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
@@ -829,9 +837,11 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                         _info(f"  (built graphs in {_elapsed:.1f}s)")
 
                 # Stats cache: only for unfiltered, unconstrained runs (full dataset).
-                cache_path = _cache_path(lat_path, field_filters)
+                # TODO Need latency_key in the cache path
+                cache_path = _cache_path(lat_path, field_filters,latency_key)
                 source_mtime = os.path.getmtime(lat_path)
                 use_stats_cache = not field_filters and min_val is None and max_val is None
+                # TODO Need to cach on the latency_key
                 cached_stats = _get_cached_stats(cache_path, source_mtime) if use_stats_cache else None
                 if cached_stats:
                     data.update(cached_stats)
@@ -868,7 +878,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
 
             if source:
                 range_key = f"{min_val}-{max_val}"
-                cache_path_s = _cache_path(lat_path, field_filters)
+                cache_path_s = _cache_path(lat_path, field_filters, latency_key)
                 source_mtime_s = os.path.getmtime(lat_path)
                 cached_s = _load_cache(cache_path_s, source_mtime_s) or {}
                 cached_card = cached_s.get("cardinality", {}).get(range_key)
