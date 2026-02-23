@@ -268,10 +268,46 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
         # need_labels=True, or old cache without timestamps — fall through to full parse
 
+    # Warm path for label-filtered calls: if the base (unfiltered) kbcache has labels,
+    # filter in memory rather than re-reading the source file.
+    if label_filters:
+        base_path   = _cache_path(filepath, None)
+        base_cached = _load_cache(base_path, source_mtime)
+        if base_cached is not None and "labels" in base_cached:
+            _elapsed      = time.perf_counter() - _t0
+            bc_values     = base_cached["values"]
+            bc_timestamps = base_cached["timestamps"]
+            bc_labels     = base_cached["labels"]
+            triples = [(v, ts, lab)
+                       for v, ts, lab in zip(bc_values, bc_timestamps, bc_labels)
+                       if match_label_filters({"labels": lab}, label_filters)]
+            values     = [t[0] for t in triples]
+            timestamps = [t[1] for t in triples]
+            labs       = [t[2] for t in triples]
+            key_counters = defaultdict(Counter)
+            for lab in labs:
+                for k, v in lab.items():
+                    key_counters[k][v] += 1
+            _save_cache(cache_path, {
+                "values": values,
+                "timestamps": timestamps,
+                "cardinality": {"None-None-None-None":
+                                {k: dict(v) for k, v in key_counters.items()}},
+            })
+            _info(f"  (filtered from base cache in {_elapsed:.1f}s)")
+            if not return_entries:
+                return values
+            if need_labels:
+                return [{"labels": lab, "value": v, "timestamp": ts}
+                        for lab, v, ts in zip(labs, values, timestamps)]
+            return [{"value": v, "timestamp": ts} for v, ts in zip(values, timestamps)]
+
     _t0 = time.perf_counter()
-    entries = []
-    values = []
-    timestamps = []
+    entries      = []
+    values       = []
+    timestamps   = []
+    labels_list  = []
+    key_counters = defaultdict(Counter)
     with open(filepath, "rb") as f:
         _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
         if not _ijson and not isinstance(_iter, list):
@@ -289,16 +325,28 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             ts_dt = _parse_timestamp(entry.get("timestamp", ""))
             ts_epoch = ts_dt.timestamp() if ts_dt is not None else 0.0
             timestamps.append(ts_epoch)
+            lab = entry.get("labels") or {}
+            labels_list.append(lab)
+            for k, v in lab.items():
+                key_counters[k][v] += 1
             if return_entries and need_labels:
                 entries.append({**entry, "value": fval, "timestamp": ts_epoch})
     _elapsed = time.perf_counter() - _t0
     _info(f"  (raw loaded in {_elapsed:.1f}s)")
     # Sort by value before caching so callers can skip sorting on cache hits.
     # All entry consumers (scatter, clip_entries_to_time_range) re-sort by time themselves.
-    paired = sorted(zip(values, timestamps))
-    values = [p[0] for p in paired]
-    timestamps = [p[1] for p in paired]
-    _save_cache(cache_path, {"values": values, "timestamps": timestamps})
+    paired = sorted(zip(values, timestamps, labels_list), key=lambda p: (p[0], p[1]))
+    values      = [p[0] for p in paired]
+    timestamps  = [p[1] for p in paired]
+    labels_list = [p[2] for p in paired]
+    cardinality_cache = {"None-None-None-None": {k: dict(v) for k, v in key_counters.items()}}
+    if not label_filters:
+        # Base cache: include labels to enable in-memory filtering for future --label calls.
+        _save_cache(cache_path, {"values": values, "timestamps": timestamps,
+                                 "labels": labels_list, "cardinality": cardinality_cache})
+    else:
+        _save_cache(cache_path, {"values": values, "timestamps": timestamps,
+                                 "cardinality": cardinality_cache})
     if return_entries and not need_labels:
         # Reconstruct minimal entries from already-collected parallel arrays —
         # avoids building 5M full entry dicts during the parse loop.
@@ -342,8 +390,9 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
         return _apply_range(entries)
 
     def _parse_source(key):
-        """Parse source JSON, return (ts_list, value_list) for entries that pass filters."""
+        """Parse source JSON, return (ts_list, value_list, cardinality) for filtered entries."""
         ts_out, val_out = [], []
+        card = defaultdict(Counter)
         with open(lat_path, 'rb') as f:
             _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
             if not _ijson and not isinstance(_iter, list):
@@ -360,7 +409,10 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
                 if epoch is not None:
                     ts_out.append(epoch)
                     val_out.append(i[key])
-        return ts_out, val_out
+                    for fk, fv in i.items():
+                        if fk not in _LAT_SKIP and not isinstance(fv, dict):
+                            card[fk][str(fv)] += 1
+        return ts_out, val_out, card
 
     def _parse_source_full(key):
         """Parse source JSON, return full entry dicts (applying field filters and value clip)."""
@@ -395,7 +447,7 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
     # Incremental update: cache valid, has ts column, but missing this latency key.
     # Only attempt for unfiltered caches (filter combos always get a cold parse).
     if not field_filters and cached is not None and "ts" in cached:
-        new_ts, new_vals = _parse_source(latency_key)
+        new_ts, new_vals, _ = _parse_source(latency_key)
         if len(new_ts) == len(cached["ts"]):
             cached[latency_key] = new_vals
             cached["fields"] = cached.get("fields", []) + [latency_key]
@@ -406,8 +458,13 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
         # Count mismatch — fall through to cold parse.
 
     # Cold parse (mtime expired, count mismatch, or filtered combo not yet cached).
-    ts_list, val_list = _parse_source(latency_key)
-    _save_cache(cache_path, {"fields": [latency_key], "ts": ts_list, latency_key: val_list})
+    ts_list, val_list, card = _parse_source(latency_key)
+    _save_cache(cache_path, {
+        "fields": [latency_key],
+        "ts": ts_list,
+        latency_key: val_list,
+        "cardinality": {"None-None": {k: dict(v) for k, v in card.items()}},
+    })
     _info(f"  (latency cache built in {time.perf_counter()-_t0:.1f}s)")
     entries = [{"timestamp": ts, latency_key: v} for ts, v in zip(ts_list, val_list)]
     return _apply_range(entries)
@@ -1095,7 +1152,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _info(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
         _info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
-
+    _info("  (analysis complete)")
 
 
 def _classify_cv(cv):
@@ -1256,3 +1313,8 @@ if __name__ == "__main__":
                     tmax_sec=args.tmax,
                     top_labels=args.top_labels,
                 )
+    _t0 = time.perf_counter()
+    _mem_cache.clear()
+    _elapsed = time.perf_counter() - _t0
+    if _elapsed > 0.1:
+        _info(f"(cache freed in {_elapsed:.1f}s)")
