@@ -9,8 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Setup and Running
 
 ```bash
-# Install the only external dependency
-pip install plotille==5.0.0
+# Install dependencies
+pip install plotille==5.0.0 tqdm ijson msgpack orjson
 
 # Make the script executable (if needed)
 chmod +x parser.py
@@ -49,6 +49,8 @@ Use these to manually verify both modes against real data in the repo:
 ./parser.py 2178a534 metrics containerCPU --no-visuals
 ./parser.py 2178a534 metrics containerCPU
 ./parser.py 2178a534 metrics containerCPU --top-labels 20
+./parser.py 2178a534 metrics containerCPU -b ,0.05 --no-visuals
+./parser.py 2178a534 metrics containerCPU -t 3621,6036 --no-visuals
 ```
 
 Test data lives under directories matched by the fragment `2178a534` (collected-metrics and log file). Large test data files are excluded from Claude's context via `.claudeignore`.
@@ -81,7 +83,13 @@ Classification is determined by running `find_pairs_recursively` on all non-`met
 
 ### Caching
 
-Large JSON files are cached in `.kbcache.json` companion files (sibling to the source). Cache keys use an MD5 hash of label filters; cache is invalidated when the source file's mtime changes. Both raw values and pre-computed statistics are stored.
+Cache files sit alongside the source JSON. Format is `.kbcache.msgpack` when msgpack is available, falling back to `.kbcache.json`. Cache is invalidated when the source file's mtime changes.
+
+- **In-memory cache** (`_mem_cache`): avoids re-reading the same file more than once per run.
+- **Main values cache** (`_cache_path`): keyed on label filters only. Write-once on cold parse; never rewritten to append filter results. Stores sorted values, timestamps, and a `"stats"` sub-key with pre-computed mean/stdev/CV/percentiles.
+- **Subset cache** (`_metrics_cache_path`, suffix `_sub_<hash>`): keyed on all active filter dimensions combined — label filters, value range (`-b`), and time range (`-t`). Stores the already-filtered values + stats so warm runs with filters skip loading the large main cache entirely.
+
+**Known issue:** `-S` (cardinality / `need_labels=True`) currently bypasses the cache and triggers a cold ijson re-parse. Scheduled for fix in the caching simplification refactor.
 
 ### CSV Column Order
 
@@ -94,3 +102,19 @@ CV is used to classify scheduling parallelism patterns. Scheduling throughput (`
 ### plotille Dependency
 
 plotille is imported at runtime and the tool degrades gracefully if it is missing (prints a warning, skips visuals). `--no-visuals` also bypasses all plot rendering.
+
+### Progress Indicators
+
+All optional deps (plotille, tqdm, ijson, msgpack, orjson) degrade gracefully when absent.
+
+- **`_progress(iterable, desc, unit)`**: wraps ijson streaming loops with a tqdm count+rate bar. No-ops when tqdm is missing, `--quiet` is set, or stderr is not a TTY.
+- **`_spinner(desc, show_timer)`**: context manager for blocking non-iterating operations.
+  - `show_timer=True` — background thread updates an elapsed counter every 1 s. Works for pure-Python ops where the GIL is released between bytecodes (e.g. plotille rendering, statistics computation).
+  - `show_timer=False` — static label only, no thread. Used for C-extension ops (msgpack/json deserialisation) where the GIL is held and a frozen timer would be misleading.
+- Graph output is buffered via `redirect_stdout(io.StringIO())` while the spinner is active to prevent the tqdm line and plot content from interleaving. The buffer's `isatty` is patched to mirror `sys.stdout.isatty` so plotille emits ANSI colour codes correctly.
+
+### Planned Refactor
+
+Latency entries (`podLatencyMeasurement-*.json`) and generic metrics entries share the same conceptual shape — `{timestamp, value}` pairs — but are loaded and processed through completely separate code paths (`process_automation` / `_load_lat_metrics` vs `run_generic_metrics_analysis` / `load_generic_metrics`). This causes duplicated filtering, stats, and plotting logic and means the `-t` time-range filter currently only works in metrics mode.
+
+The intended fix is to normalise latency entries into the common `{timestamp, value}` format early in the pipeline so all downstream logic (time-clipping, stats, caching, plotting) can be shared. This refactor should happen alongside the caching simplification.
