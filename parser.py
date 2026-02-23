@@ -1006,6 +1006,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     _t0 = time.perf_counter()
                     # m_list is already range-clipped; pass no min/max to avoid double-clip
                     _buf = io.StringIO()
+                    _buf.isatty = sys.stdout.isatty  # preserve TTY status so plotille emits ANSI colours
                     with _spinner(desc="  Building graphs"):
                         with redirect_stdout(_buf):
                             print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key)
@@ -1332,6 +1333,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
             _buf = io.StringIO()
+            _buf.isatty = sys.stdout.isatty  # preserve TTY status so plotille emits ANSI colours
             with _spinner(desc="  Building graphs"):
                 with redirect_stdout(_buf):
                     if scatter and entries is not None:
