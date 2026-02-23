@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 from collections import Counter, defaultdict
+from contextlib import contextmanager, redirect_stdout
 import csv
+import io
 import datetime
 import enum
 import hashlib
@@ -12,6 +14,7 @@ import random
 import re
 import statistics
 import sys
+import threading
 import time
 
 # Attempt to import plotille for terminal visuals
@@ -48,6 +51,13 @@ except ImportError:
     print("[!] Run 'pip install msgpack' for faster cache reads/writes.")
     _msgpack = None
 
+# Use tqdm for progress bars on long streaming parse operations.
+try:
+    import tqdm as _tqdm_mod
+except ImportError:
+    print("[!] Run 'pip install tqdm' to enable progress bars during cold parse.")
+    _tqdm_mod = None
+
 # Logging verbosity — set from CLI args in __main__.
 _verbose = False
 _quiet   = False
@@ -61,6 +71,69 @@ def _debug(msg):
     """Verbose detail. Only shown with --verbose."""
     if _verbose:
         print(msg)
+
+@contextmanager
+def _spinner(desc="", show_timer=True):
+    """Show an animated tqdm spinner on stderr during a blocking operation.
+
+    Falls back to a no-op when tqdm is unavailable, --quiet is active, or
+    stderr is not a TTY (pipes/redirects), so no escape codes leak into output.
+
+    show_timer=True  — background thread updates an elapsed counter every 1s.
+                       Works when the GIL is released (pure-Python ops).
+    show_timer=False — static label only; no thread started. Use when the
+                       blocking work is inside a C extension that holds the GIL,
+                       where a frozen timer would be misleading.
+    """
+    if _tqdm_mod is None or _quiet or not sys.stderr.isatty():
+        yield
+        return
+    bar = _tqdm_mod.tqdm(
+        total=0,
+        desc=f"{desc} [0.0s]" if show_timer else desc,
+        bar_format="{desc}",
+        file=sys.stderr,
+        leave=False,
+    )
+    if not show_timer:
+        try:
+            yield
+        finally:
+            bar.close()
+        return
+    start = time.perf_counter()
+    done = threading.Event()
+    def _refresh():
+        while not done.wait(1.0):
+            elapsed = time.perf_counter() - start
+            bar.set_description(f"{desc} [{elapsed:.1f}s]")
+            bar.refresh()
+    t = threading.Thread(target=_refresh, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        done.set()
+        t.join()
+        bar.close()
+
+def _progress(iterable, desc="", unit=" entries"):
+    """Wrap iterable with a tqdm progress bar when tqdm is available and not quiet.
+
+    Falls back transparently to the raw iterable when tqdm is missing or --quiet
+    is active. tqdm auto-disables when stderr is not a TTY (pipes, redirects).
+    """
+    if _tqdm_mod is None or _quiet:
+        return iterable
+    return _tqdm_mod.tqdm(
+        iterable,
+        desc=desc,
+        unit=unit,
+        unit_scale=True,    # e.g. 1.2M instead of 1200000
+        mininterval=0.5,    # update at most every 0.5s — negligible overhead
+        file=sys.stderr,
+        leave=False,        # bar clears on completion; no permanent terminal line
+    )
 
 # --- 1. DYNAMIC COLUMN CONFIGURATION ---
 # Percentiles we want to calculate
@@ -182,12 +255,15 @@ def _load_cache(cache_path, source_mtime):
                 return None
             if os.path.getmtime(path) < source_mtime:
                 return None
+            fname = os.path.basename(path)
             if path.endswith('.msgpack') and _msgpack:
                 with open(path, 'rb') as f:
-                    data = _msgpack.unpackb(f.read(), raw=False)
+                    with _spinner(desc=f"  Loading {fname}, please wait", show_timer=False):
+                        data = _msgpack.unpackb(f.read(), raw=False)
             else:
                 with open(path) as f:
-                    data = json.load(f)
+                    with _spinner(desc=f"  Loading {fname}, please wait", show_timer=False):
+                        data = json.load(f)
             if isinstance(data, list):      # upgrade old list format
                 return {"values": data}
             return data if isinstance(data, dict) else None
@@ -203,12 +279,15 @@ def _load_cache(cache_path, source_mtime):
 
 def _save_cache(cache_path, data):
     try:
+        fname = os.path.basename(cache_path)
         if cache_path.endswith('.msgpack') and _msgpack:
             with open(cache_path, 'wb') as f:
-                f.write(_msgpack.packb(data, use_bin_type=True))
+                with _spinner(desc=f"  Saving {fname}, please wait", show_timer=False):
+                    f.write(_msgpack.packb(data, use_bin_type=True))
         else:
             with open(cache_path, 'w') as f:
-                json.dump(data, f)
+                with _spinner(desc=f"  Saving {fname}, please wait", show_timer=False):
+                    json.dump(data, f)
         # Keep in-memory cache in sync so subsequent reads in this run see the update.
         _mem_cache[cache_path] = (os.path.getmtime(cache_path), data)
     except Exception:
@@ -308,11 +387,12 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     timestamps   = []
     labels_list  = []
     key_counters = defaultdict(Counter)
+    fname = os.path.basename(filepath)
     with open(filepath, "rb") as f:
         _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
         if not _ijson and not isinstance(_iter, list):
             _iter = [_iter]
-        for entry in _iter:
+        for entry in _progress(_iter, desc=f"  Parsing {fname}"):
             if "value" not in entry:
                 continue
             if not match_label_filters(entry, label_filters):
@@ -397,7 +477,7 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
             _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
             if not _ijson and not isinstance(_iter, list):
                 _iter = []
-            for i in _iter:
+            for i in _progress(_iter, desc="  Parsing latency"):
                 if key not in i or "timestamp" not in i:
                     continue
                 if not _match_lat_filters(i, field_filters):
@@ -421,7 +501,7 @@ def _load_lat_metrics(lat_path, latency_key, field_filters=None, min_val=None, m
             _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
             if not _ijson and not isinstance(_iter, list):
                 _iter = []
-            for i in _iter:
+            for i in _progress(_iter, desc="  Parsing latency (full)"):
                 if key not in i or "timestamp" not in i:
                     continue
                 if not _match_lat_filters(i, field_filters):
@@ -888,7 +968,11 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                 if not no_visuals:
                     _t0 = time.perf_counter()
                     # m_list is already range-clipped; pass no min/max to avoid double-clip
-                    print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key)
+                    _buf = io.StringIO()
+                    with _spinner(desc="  Building graphs"):
+                        with redirect_stdout(_buf):
+                            print_visuals(m_list, pair['fragment'], data['scheduler'], latency_key)
+                    print(_buf.getvalue(), end="")
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         _info(f"  (built graphs in {_elapsed:.1f}s)")
@@ -1143,10 +1227,14 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             if len(plot_vals) < len(sorted_vals):
                 _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
-            if scatter and entries is not None:
-                _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0, min_val=min_val)
-            _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
-            _plot_cdf(plot_vals, title_suffix=title_suffix)
+            _buf = io.StringIO()
+            with _spinner(desc="  Building graphs"):
+                with redirect_stdout(_buf):
+                    if scatter and entries is not None:
+                        _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0, min_val=min_val)
+                    _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
+                    _plot_cdf(plot_vals, title_suffix=title_suffix)
+            print(_buf.getvalue(), end="")
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
                 _info(f"  (built graphs in {_elapsed:.1f}s)")
