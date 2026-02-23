@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import bisect
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
@@ -238,6 +239,42 @@ def _cache_path(filepath, label_filters=None, latency_key=None):
         key = hashlib.md5(str(latency_key).encode()).hexdigest()[:8]
         return f"{base}_{key}{ext}"
     return f"{base}{ext}"
+
+def _metrics_cache_path(filepath, label_filters=None, min_val=None, max_val=None,
+                         tmin_sec=None, tmax_sec=None):
+    """Cache path for a fully-filtered subset of metrics data.
+
+    All active filter dimensions — label, value range (-b), and time range (-t)
+    — are folded into one hash so each unique combination gets its own small
+    file.  The large values cache is written once on cold parse and never
+    rewritten to add a filtered result.
+
+    Matches _cache_path() when only label_filters are set (no bin/time),
+    so the existing label-filtered cache is reused rather than duplicated.
+    """
+    base = os.path.splitext(filepath)[0]
+    ext = ".kbcache.msgpack" if _msgpack else ".kbcache.json"
+    has_bin  = min_val is not None or max_val is not None
+    has_time = tmin_sec is not None or tmax_sec is not None
+    if not has_bin and not has_time:
+        # Delegate to the existing label-filter path for backward compatibility.
+        if label_filters:
+            key = hashlib.md5(str(sorted(label_filters.items())).encode()).hexdigest()[:8]
+            return f"{base}_{key}{ext}"
+        return f"{base}{ext}"
+    parts = {}
+    if label_filters:
+        parts['l'] = str(sorted(label_filters.items()))
+    if min_val is not None:
+        parts['lo'] = str(min_val)
+    if max_val is not None:
+        parts['hi'] = str(max_val)
+    if tmin_sec is not None:
+        parts['tlo'] = str(tmin_sec)
+    if tmax_sec is not None:
+        parts['thi'] = str(tmax_sec)
+    key = hashlib.md5(str(sorted(parts.items())).encode()).hexdigest()[:8]
+    return f"{base}_sub_{key}{ext}"
 
 def _load_cache(cache_path, source_mtime):
     """Return cached dict (with 'values' or 'stats' keys) or None.
@@ -1087,55 +1124,74 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     need_labels = source and cached_card is None
     need_entries = scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
+
+    # Subset cache: one small file per unique (label + bin + time) filter combo.
+    # On a warm hit we skip load_generic_metrics entirely — no 4-second main cache load.
+    # Only applies when full entries aren't needed (scatter/source/time-filter set need_entries).
+    has_subset_filters = (min_val is not None or max_val is not None or
+                          tmin_sec is not None or tmax_sec is not None)
+    subset_path = (_metrics_cache_path(filepath, label_filters, min_val, max_val, tmin_sec, tmax_sec)
+                   if has_subset_filters else None)
+    _subset = None
+    _subset_fast_path = False
+    if subset_path and not need_entries:
+        _subset = _load_cache(subset_path, source_mtime)
+        if _subset and "values" in _subset:
+            values          = _subset["values"]
+            values_presorted = True
+            _info("  (subset cache loaded)")
+            _subset_fast_path = True
+
     entries = None
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
-    if need_entries:
-        entries = load_generic_metrics(filepath, label_filters=label_filters,
-                                       return_entries=True, need_labels=need_labels)
-        if tmin_sec is not None or tmax_sec is not None:
-            # Single pass: parse timestamps once, sort once, derive scatter_t0
-            # and filter in the same loop — avoids the previous double-parse +
-            # redundant sort inside clip_entries_to_time_range.
-            original_n = len(entries)
+    if not _subset_fast_path:
+        if need_entries:
+            entries = load_generic_metrics(filepath, label_filters=label_filters,
+                                           return_entries=True, need_labels=need_labels)
+            if tmin_sec is not None or tmax_sec is not None:
+                # Single pass: parse timestamps once, sort once, derive scatter_t0
+                # and filter in the same loop — avoids the previous double-parse +
+                # redundant sort inside clip_entries_to_time_range.
+                original_n = len(entries)
+                _t0 = time.perf_counter()
+                # Extract timestamps as a flat float list — no tuple allocation, no sort.
+                # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
+                # Fall back to _parse_timestamp only for legacy string-timestamp caches.
+                first_ts = entries[0].get("timestamp") if entries else None
+                if isinstance(first_ts, (int, float)):
+                    ts_list = [e["timestamp"] for e in entries]
+                else:
+                    ts_list = [
+                        (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
+                        for e in entries
+                    ]
+                _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
+                _t0 = time.perf_counter()
+                if ts_list:
+                    t0_epoch = min(ts_list)
+                    scatter_t0 = datetime.datetime.fromtimestamp(t0_epoch, tz=datetime.timezone.utc)
+                    entries = [
+                        e for e, ts in zip(entries, ts_list)
+                        if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
+                        and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
+                    ]
+                else:
+                    entries = []
+                _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
+                if not entries:
+                    print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
+                    return
+                _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
             _t0 = time.perf_counter()
-            # Extract timestamps as a flat float list — no tuple allocation, no sort.
-            # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
-            # Fall back to _parse_timestamp only for legacy string-timestamp caches.
-            first_ts = entries[0].get("timestamp") if entries else None
-            if isinstance(first_ts, (int, float)):
-                ts_list = [e["timestamp"] for e in entries]
-            else:
-                ts_list = [
-                    (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
-                    for e in entries
-                ]
-            _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
-            _t0 = time.perf_counter()
-            if ts_list:
-                t0_epoch = min(ts_list)
-                scatter_t0 = datetime.datetime.fromtimestamp(t0_epoch, tz=datetime.timezone.utc)
-                entries = [
-                    e for e, ts in zip(entries, ts_list)
-                    if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
-                    and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
-                ]
-            else:
-                entries = []
-            _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
-            if not entries:
-                print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
-                return
-            _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
-        _t0 = time.perf_counter()
-        values = [e["value"] for e in entries]
-        _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
-        # Pre-sorted when entries came from cache in value order (no time-filter, no
-        # cold label parse). Time-filter picks a non-contiguous subset; a cold
-        # need_labels parse returns file order — neither is guaranteed sorted.
-        values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
-    else:
-        values = load_generic_metrics(filepath, label_filters=label_filters)
-        values_presorted = True   # load_generic_metrics caches sorted values
+            values = [e["value"] for e in entries]
+            _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
+            # Pre-sorted when entries came from cache in value order (no time-filter, no
+            # cold label parse). Time-filter picks a non-contiguous subset; a cold
+            # need_labels parse returns file order — neither is guaranteed sorted.
+            values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
+        else:
+            values = load_generic_metrics(filepath, label_filters=label_filters)
+            values_presorted = True   # load_generic_metrics caches sorted values
 
     if not values:
         print(f"[!] No values found in {filepath}" + (
@@ -1157,55 +1213,101 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
-    _t0 = time.perf_counter()
-    cached_stats = _get_cached_stats(cache_path, source_mtime)
-    _debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
-
-    if cached_stats:
-        avg   = cached_stats["avg"]
-        stdev = cached_stats["stdev"]
-        cv    = cached_stats["cv"]
-        p50   = cached_stats["p50"]
-        p90   = cached_stats["p90"]
-        p99   = cached_stats["p99"]
+    if _subset_fast_path:
+        # Values already filtered; stats stored alongside them in the subset cache.
+        subset_stats = _subset.get("stats")
+        if subset_stats:
+            avg   = subset_stats["avg"]
+            stdev = subset_stats["stdev"]
+            cv    = subset_stats["cv"]
+            p50   = subset_stats["p50"]
+            p90   = subset_stats["p90"]
+            p99   = subset_stats["p99"]
+            _info("  (stats cache loaded)")
+        else:
+            # Subset cache exists but lacks stats — compute and patch it.
+            _t0 = time.perf_counter()
+            with _spinner(desc="  Computing stats", show_timer=True):
+                avg   = statistics.mean(sorted_vals)
+                stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
+                cv    = round(stdev / avg, 3) if avg else 0.0
+                p50   = statistics.median(sorted_vals)
+                p90   = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
+                p99   = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
+            _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
+            _subset["stats"] = {"avg": avg, "stdev": stdev, "cv": cv,
+                                "p50": p50, "p90": p90, "p99": p99}
+            _save_cache(subset_path, _subset)
+        _min = sorted_vals[0] if sorted_vals else None
+        _max = sorted_vals[-1] if sorted_vals else None
     else:
+        # --- Unfiltered stats (full dataset) ---
         _t0 = time.perf_counter()
-        avg   = statistics.mean(sorted_vals)
-        stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
-        cv    = round(stdev / avg, 3) if avg else 0.0
-        p50   = statistics.median(sorted_vals)
-        p90   = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
-        p99   = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
-        _elapsed = time.perf_counter() - _t0
-        if _elapsed > 0.5:
-            _info(f"  (crunched numbers in {_elapsed:.1f}s)")
-        _t0 = time.perf_counter()
-        _save_stats_to_cache(cache_path, source_mtime, "values", values,
-                             {"avg": avg, "stdev": stdev, "cv": cv,
-                              "p50": p50, "p90": p90, "p99": p99,
-                              "min": min(sorted_vals), "max": max(sorted_vals)})
-        _debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
+        cached_stats = _get_cached_stats(cache_path, source_mtime)
+        _debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
 
-    # If a value range filter is active, recompute display stats on the visible subset.
-    # Cache always stores full-dataset stats; these are display-only overrides.
-    if min_val is not None or max_val is not None:
-        display_vals = clip_to_range(sorted_vals, min_val, max_val)
-        if display_vals:
-            dn    = len(display_vals)
-            n     = dn
-            avg   = statistics.mean(display_vals)
-            stdev = statistics.stdev(display_vals) if dn > 1 else 0.0
-            cv    = round(stdev / avg, 3) if avg else 0.0
-            p50   = statistics.median(display_vals)
-            p90   = statistics.quantiles(display_vals, n=10)[8] if dn >= 10 else display_vals[-1]
-            p99   = statistics.quantiles(display_vals, n=100)[98] if dn >= 100 else display_vals[-1]
-    else:
-        display_vals = sorted_vals
+        if cached_stats:
+            avg   = cached_stats["avg"]
+            stdev = cached_stats["stdev"]
+            cv    = cached_stats["cv"]
+            p50   = cached_stats["p50"]
+            p90   = cached_stats["p90"]
+            p99   = cached_stats["p99"]
+            _info("  (stats cache loaded)")
+        else:
+            _t0 = time.perf_counter()
+            with _spinner(desc="  Computing stats", show_timer=True):
+                avg   = statistics.mean(sorted_vals)
+                stdev = statistics.stdev(sorted_vals) if n > 1 else 0.0
+                cv    = round(stdev / avg, 3) if avg else 0.0
+                p50   = statistics.median(sorted_vals)
+                p90   = statistics.quantiles(sorted_vals, n=10)[8] if n >= 10 else sorted_vals[-1]
+                p99   = statistics.quantiles(sorted_vals, n=100)[98] if n >= 100 else sorted_vals[-1]
+            _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
+            _t0 = time.perf_counter()
+            _save_stats_to_cache(cache_path, source_mtime, "values", values,
+                                 {"avg": avg, "stdev": stdev, "cv": cv,
+                                  "p50": p50, "p90": p90, "p99": p99,
+                                  "min": sorted_vals[0], "max": sorted_vals[-1]})
+            _debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
+
+        # --- Apply bin filter and build/write subset cache ---
+        # sorted_vals is pre-sorted; bisect finds boundaries in O(log n) rather
+        # than scanning all elements (clip_to_range doesn't know the list is sorted).
+        if min_val is not None or max_val is not None:
+            lo = bisect.bisect_left(sorted_vals, min_val) if min_val is not None else 0
+            hi = bisect.bisect_right(sorted_vals, max_val) if max_val is not None else len(sorted_vals)
+            display_vals = sorted_vals[lo:hi]
+            if display_vals:
+                dn  = len(display_vals)
+                n   = dn
+                _t0 = time.perf_counter()
+                with _spinner(desc="  Computing filtered stats", show_timer=True):
+                    avg   = statistics.mean(display_vals)
+                    stdev = statistics.stdev(display_vals) if dn > 1 else 0.0
+                    cv    = round(stdev / avg, 3) if avg else 0.0
+                    p50   = statistics.median(display_vals)
+                    p90   = statistics.quantiles(display_vals, n=10)[8] if dn >= 10 else display_vals[-1]
+                    p99   = statistics.quantiles(display_vals, n=100)[98] if dn >= 100 else display_vals[-1]
+                _info(f"  (crunched filtered numbers in {time.perf_counter()-_t0:.1f}s)")
+                _min, _max = display_vals[0], display_vals[-1]
+                if subset_path:
+                    _save_cache(subset_path, {
+                        "values": display_vals,
+                        "stats":  {"n": n, "avg": avg, "stdev": stdev, "cv": cv,
+                                   "p50": p50, "p90": p90, "p99": p99,
+                                   "min": _min, "max": _max},
+                    })
+            else:
+                _min = _max = None
+        else:
+            _min = sorted_vals[0] if sorted_vals else None
+            _max = sorted_vals[-1] if sorted_vals else None
 
     extra = [f"Label filters: {label_filters}"] if label_filters else None
     _print_stats_table(
         f"METRICS: {display_name}", n, avg, stdev, cv, p50, p90, p99,
-        min_val=min(display_vals), max_val=max(display_vals), extra_lines=extra,
+        min_val=_min, max_val=_max, extra_lines=extra,
     )
 
     # Show label cardinality only when --source is explicitly requested.
@@ -1220,11 +1322,13 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
 
     if not no_visuals and plotille:
-        plot_vals = clip_to_range(sorted_vals, min_val, max_val)
+        # Fast path: sorted_vals is already the filtered subset — no clip needed.
+        # Slow path: clip the full sorted_vals to the display range.
+        plot_vals = sorted_vals if _subset_fast_path else clip_to_range(sorted_vals, min_val, max_val)
         if not plot_vals:
             print(f"  [!] No values in range [{min_val}, {max_val}]")
         else:
-            if len(plot_vals) < len(sorted_vals):
+            if not _subset_fast_path and len(plot_vals) < len(sorted_vals):
                 _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
             _buf = io.StringIO()
