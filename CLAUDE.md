@@ -16,24 +16,6 @@ pip install plotille==5.0.0 tqdm ijson msgpack orjson
 chmod +x parser.py
 ```
 
-**Latency mode** (no `metrics` keyword):
-```bash
-./parser.py fragment1 fragment2
-./parser.py --min 100 --max 5000 fragment1
-./parser.py --bucket "12083200, 12096000" fragment1
-./parser.py --no-visuals fragment1
-```
-
-**Metrics mode** (include `metrics` keyword; arg order is irrelevant):
-```bash
-./parser.py fragment1 metrics containerCPU
-./parser.py fragment1 metrics containerCPU cgroupCPU
-./parser.py metrics containerCPU fragment1 --label id=/kubepods.slice
-./parser.py fragment1 metrics containerCPU -m "Display Name" --no-visuals
-```
-
-There are no automated tests. The `sample-cgroupCPU.json` file serves as example input for metrics mode.
-
 ## Test Commands
 
 Use these to manually verify both modes against real data in the repo:
@@ -47,8 +29,7 @@ Use these to manually verify both modes against real data in the repo:
 **Metrics mode:**
 ```bash
 ./parser.py 2178a534 metrics containerCPU --no-visuals
-./parser.py 2178a534 metrics containerCPU
-./parser.py 2178a534 metrics containerCPU --top-labels 20
+./parser.py 2178a534 metrics containerCPU --top-labels 20 -S
 ./parser.py 2178a534 metrics containerCPU -b ,0.05 --no-visuals
 ./parser.py 2178a534 metrics containerCPU -t 3621,6036 --no-visuals
 ```
@@ -66,9 +47,9 @@ Positionals are classified by content, not position:
 - any arg matching a real `.log` / `collected-metrics-*` entry → UUID fragment
 - remaining args when `metrics` is present → metric file names
 
-Classification is determined by running `find_pairs_recursively` on all non-`metrics` candidates; matched ones are UUID fragments, unmatched ones are metric file names. The caller guarantees no collision between the two sets.
+Classification is determined by running `find_pairs_recursively` on all non-`metrics` candidates; matched ones are UUID fragments, unmatched ones are metric file names. The caller guarantees no collision between the two sets. Recursively scans the current directory for `.log` files and `collected-metrics-<UUID>/` directories matching the given UUID fragments.
 
-1. **Latency analysis:** Recursively scans the current directory for `.log` files and `collected-metrics-<UUID>/` directories matching the given UUID fragments. Extracts scheduling latency data from `podLatencyMeasurement-*.json` and job metadata from `jobSummary.json`.
+1. **Latency analysis:**  Extracts scheduling latency data from `podLatencyMeasurement-*.json` and job metadata from `jobSummary.json`.
 
 2. **Metrics analysis (optional):** Loads each named metrics JSON file (array of `{metric: {labels}, value}` objects) from the discovered `collected-metrics-<UUID>/` directory, optionally filtering by `--label KEY=VALUE` pairs.
 
