@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import bisect
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
@@ -18,11 +17,6 @@ import sys
 import threading
 import time
 import logging
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)5s %(filename)s:%(lineno)-4d : %(message)s",
-    level=logging.DEBUG
-)
 
 # Attempt to import plotille for terminal visuals
 try:
@@ -68,6 +62,7 @@ except ImportError:
 # Logging verbosity — set from CLI args in __main__.
 _verbose = False
 _quiet   = False
+LOG_FORMAT="%(asctime)s %(levelname)5s %(filename)s:%(lineno)-4d : %(message)s"
 
 def _info(msg):
     """Diagnostic/timing print. Shown by default; suppressed by --quiet."""
@@ -222,8 +217,7 @@ def match_label_filters(entry, label_filters):
 # Key: cache_path → value: (source_mtime_threshold, data_dict)
 _mem_cache = {}
 
-def _metrics_cache_path(filepath, label_filters=None, min_val=None, max_val=None,
-                         tmin_sec=None, tmax_sec=None, latency_key=None):
+def _metrics_cache_path(filepath, label_filters=None, latency_key=None):
     """Return the cache file path for a given combination of filter dimensions.
 
     All active dimensions — label filters, latency key, value range (-b), and
@@ -232,14 +226,10 @@ def _metrics_cache_path(filepath, label_filters=None, min_val=None, max_val=None
     single-component hash for backward compatibility with existing cache files.
 
     File naming:
-      - No filters at all:         <base>.kbcache.{msgpack,json}
-      - Labels or latency_key only: <base>_<hash8>.kbcache.*
-      - Any bin/time filter:        <base>_sub_<hash8>.kbcache.*
+      - Labels or latency_key: <base>_<hash8>.kbcache.*
     """
     base = os.path.splitext(filepath)[0]
     ext = ".kbcache.msgpack" if _msgpack else ".kbcache.json"
-    has_bin  = min_val is not None or max_val is not None
-    has_time = tmin_sec is not None or tmax_sec is not None
 
     # Full hash: include every active dimension so each combination is unique.
     parts = {}
@@ -247,23 +237,15 @@ def _metrics_cache_path(filepath, label_filters=None, min_val=None, max_val=None
         parts['l'] = str(sorted(label_filters.items()))
     if latency_key:
         parts['k'] = latency_key
-    if min_val is not None:
-        parts['lo'] = str(min_val)
-    if max_val is not None:
-        parts['hi'] = str(max_val)
-    if tmin_sec is not None:
-        parts['tlo'] = str(tmin_sec)
-    if tmax_sec is not None:
-        parts['thi'] = str(tmax_sec)
     key = hashlib.md5(str(sorted(parts.items())).encode()).hexdigest()[:8]
-    return f"{base}_sub_{key}{ext}" if (has_bin or has_time) else f"{base}_{key}{ext}"
+    return f"{base}_{key}{ext}"
 
 def _load_cache(cache_path, source_mtime):
     """Return cached dict (with 'values' or 'stats' keys) or None.
     Checks _mem_cache first to avoid re-reading the file within the same run.
     Tries cache_path first; if msgpack path not found, falls back to the
     equivalent .kbcache.json for transparent upgrade of old caches."""
-    logging.info("_load_cache : {cache_path}")
+    logging.info(f"_load_cache : {cache_path}")
     # In-memory hit: same file, still valid for this source_mtime.
     mem = _mem_cache.get(cache_path)
     if mem is not None and mem[0] >= source_mtime:
@@ -272,11 +254,14 @@ def _load_cache(cache_path, source_mtime):
     def _try(path):
         try:
             if not os.path.exists(path):
+                logging.debug(f"does not exist {path}")
                 return None
             if os.path.getmtime(path) < source_mtime:
+                logging.debug(f"mtime < source_mtime {path}")
                 return None
             fname = os.path.basename(path)
             if path.endswith('.msgpack') and _msgpack:
+                logging.debug(f"opening {path}")
                 with open(path, 'rb') as f:
                     with _spinner(desc=f"  Loading {fname}, please wait", show_timer=False):
                         data = _msgpack.unpackb(f.read(), raw=False)
@@ -293,6 +278,7 @@ def _load_cache(cache_path, source_mtime):
 
     result = _try(cache_path)
     if result is None and cache_path.endswith('.msgpack'):
+        logging.debug(f"cache miss, falling back to json {cache_path}")
         result = _try(cache_path[:-len('.msgpack')] + '.json')
     if result is not None:
         _mem_cache[cache_path] = (source_mtime, result)
@@ -354,14 +340,16 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     _t0 = time.perf_counter()
     cached = _load_cache(cache_path, source_mtime)
     if cached is not None:
+        logging.debug("cache is not None")
         _elapsed = time.perf_counter() - _t0
         values = cached.get("values", [])
         if not return_entries:
-            logging.info(f"  (cache loaded in {_elapsed:.1f}s)")
+            logging.info(f"not return_entries. returning {len(values)} values")
             return values
         if not need_labels:
             logging.debug(f"does not need_labels")
             timestamps = cached.get("timestamps")
+            logging.debug(f"timestamps: {len(timestamps)} , len(values): {len(values)}")
             if timestamps is not None and len(timestamps) == len(values):
                 # One-time migration: convert legacy string timestamps to epoch floats.
                 # TODO delete ? We can just delete the cache files.
@@ -396,9 +384,11 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 return triples
         # Old cache without timestamps/labels — fall through to full parse
 
+    logging.debug("cached is None or needs_labels. Falling back to full kbcache")
     # Warm path for label-filtered calls: if the base (unfiltered) kbcache has labels,
     # filter in memory rather than re-reading the source file.
     if label_filters:
+        logging.debug("has label_filters")
         base_path   = _metrics_cache_path(filepath)
         base_cached = _load_cache(base_path, source_mtime)
         if base_cached is not None and "labels" in base_cached:
@@ -409,6 +399,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             triples = [(v, ts, lab)
                        for v, ts, lab in zip(bc_values, bc_timestamps, bc_labels)
                        if match_label_filters({"labels": lab}, label_filters)]
+            logging.debug("triples filtered by labels")
             values     = [t[0] for t in triples]
             timestamps = [t[1] for t in triples]
             labs       = [t[2] for t in triples]
@@ -416,19 +407,31 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             for lab in labs:
                 for k, v in lab.items():
                     key_counters[k][v] += 1
+            logging.debug("keys counted")
             _save_cache(cache_path, {
                 "values": values,
                 "timestamps": timestamps,
                 "cardinality": {"None-None-None-None":
                                 {k: dict(v) for k, v in key_counters.items()}},
             })
-            _info(f"  (filtered from base cache in {_elapsed:.1f}s)")
+            logging.info(f"filtered from base cache in {_elapsed:.1f}s")
             if not return_entries:
                 return values
             if need_labels:
-                return [{"labels": lab, "value": v, "timestamp": ts}
+                _t0 = time.perf_counter()
+                zipped = [{"labels": lab, "value": v, "timestamp": ts}
                         for lab, v, ts in zip(labs, values, timestamps)]
-            return [{"value": v, "timestamp": ts} for v, ts in zip(values, timestamps)]
+                _elapsed = time.perf_counter() - _t0
+                logging.debug(f"label-value-time tuple zipped from cache in {_elapsed:.1f}s")
+                return zipped
+            _t0 = time.perf_counter()
+            zipped = [{"value": v, "timestamp": ts} for v, ts in zip(values, timestamps)]
+            _elapsed = time.perf_counter() - _t0
+            logging.debug(f"value-time tuple zipped from cache in {_elapsed:.1f}s")
+            return zipped
+
+    logging.debug("no label_filters, no cache hits, loading raw json 🐌")
+    # TODO try to get the full cache instead of the raw json, and parse from there.
 
     _t0 = time.perf_counter()
     entries      = []
@@ -461,10 +464,11 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             if return_entries and need_labels:
                 entries.append({**entry, "value": fval, "timestamp": ts_epoch})
     _elapsed = time.perf_counter() - _t0
-    _info(f"  (raw loaded in {_elapsed:.1f}s)")
+    logging.info(f"  (raw loaded in {_elapsed:.1f}s)")
     # Sort by value before caching so callers can skip sorting on cache hits.
     # All entry consumers (scatter, clip_entries_to_time_range) re-sort by time themselves.
     paired = sorted(zip(values, timestamps, labels_list), key=lambda p: (p[0], p[1]))
+    logging.debug(f"raw sorted and zipped in {_elapsed:.1f}s")
     values      = [p[0] for p in paired]
     timestamps  = [p[1] for p in paired]
     labels_list = [p[2] for p in paired]
@@ -511,8 +515,7 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
 
     has_filters = (effective_lf or min_val is not None or max_val is not None
                    or tmin_sec is not None or tmax_sec is not None)
-    subset_path = (_metrics_cache_path(lat_path, effective_lf, min_val, max_val, tmin_sec, tmax_sec,
-                                        latency_key=latency_key)
+    subset_path = (_metrics_cache_path(lat_path, effective_lf, latency_key=latency_key)
                    if has_filters else None)
 
     # --- Subset cache fast path ---
@@ -1144,74 +1147,57 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     need_entries = scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
     logging.debug(f"need_entries={need_entries}")
 
-    # Subset cache: one small file per unique (label + bin + time) filter combo.
-    # On a warm hit we skip load_generic_metrics entirely — no 4-second main cache load.
-    # Only applies when full entries aren't needed (scatter/source/time-filter set need_entries).
-    has_subset_filters = (min_val is not None or max_val is not None or
-                          tmin_sec is not None or tmax_sec is not None)
-    subset_path = cache_path if has_subset_filters else None
-    _subset = None
-    _subset_fast_path = False
-    if subset_path and not need_entries:
-        _subset = _load_cache(subset_path, source_mtime)
-        if _subset and "values" in _subset:
-            values          = _subset["values"]
-            values_presorted = True
-            _info("  (subset cache loaded)")
-            _subset_fast_path = True
-
     entries = None
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
-    if not _subset_fast_path:
-        if need_entries:
-            logging.info("not _subset_fast_path and does need_entries")
-            entries = load_generic_metrics(filepath, label_filters=label_filters,
-                                           return_entries=True, need_labels=need_labels)
-            if tmin_sec is not None or tmax_sec is not None:
-                # Single pass: parse timestamps once, sort once, derive scatter_t0
-                # and filter in the same loop — avoids the previous double-parse +
-                # redundant sort inside clip_entries_to_time_range.
-                original_n = len(entries)
-                _t0 = time.perf_counter()
-                # Extract timestamps as a flat float list — no tuple allocation, no sort.
-                # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
-                # Fall back to _parse_timestamp only for legacy string-timestamp caches.
-                first_ts = entries[0].get("timestamp") if entries else None
-                if isinstance(first_ts, (int, float)):
-                    ts_list = [e["timestamp"] for e in entries]
-                else:
-                    ts_list = [
-                        (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
-                        for e in entries
-                    ]
-                _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
-                _t0 = time.perf_counter()
-                if ts_list:
-                    t0_epoch = min(ts_list)
-                    scatter_t0 = t0_epoch
-                    entries = [
-                        e for e, ts in zip(entries, ts_list)
-                        if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
-                        and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
-                    ]
-                else:
-                    entries = []
-                _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
-                if not entries:
-                    print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
-                    return
-                _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
+    if need_entries:
+        logging.info("not _subset_fast_path and does need_entries")
+        entries = load_generic_metrics(filepath, label_filters=label_filters,
+                                        return_entries=True, need_labels=need_labels)
+        if tmin_sec is not None or tmax_sec is not None:
+            # Single pass: parse timestamps once, sort once, derive scatter_t0
+            # and filter in the same loop — avoids the previous double-parse +
+            # redundant sort inside clip_entries_to_time_range.
+            original_n = len(entries)
             _t0 = time.perf_counter()
-            values = [e["value"] for e in entries]
-            logging.debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
-            # Pre-sorted when entries came from cache in value order (no time-filter, no
-            # cold label parse). Time-filter picks a non-contiguous subset; a cold
-            # need_labels parse returns file order — neither is guaranteed sorted.
-            values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
-        else:
-            logging.info("not _subset_fast_path and does not need_entries")
-            values = load_generic_metrics(filepath, label_filters=label_filters)
-            values_presorted = True   # load_generic_metrics caches sorted values
+            # Extract timestamps as a flat float list — no tuple allocation, no sort.
+            # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
+            # Fall back to _parse_timestamp only for legacy string-timestamp caches.
+            first_ts = entries[0].get("timestamp") if entries else None
+            if isinstance(first_ts, (int, float)):
+                ts_list = [e["timestamp"] for e in entries]
+            else:
+                ts_list = [
+                    (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
+                    for e in entries
+                ]
+            _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
+            _t0 = time.perf_counter()
+            if ts_list:
+                t0_epoch = min(ts_list)
+                scatter_t0 = t0_epoch
+                entries = [
+                    e for e, ts in zip(entries, ts_list)
+                    if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
+                    and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
+                ]
+            else:
+                entries = []
+            _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
+            if not entries:
+                print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
+                return
+            _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
+        _t0 = time.perf_counter()
+        values = [e["value"] for e in entries]
+        logging.debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
+        # Pre-sorted when entries came from cache in value order (no time-filter, no
+        # cold label parse). Time-filter picks a non-contiguous subset; a cold
+        # need_labels parse returns file order — neither is guaranteed sorted.
+        values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
+    else:
+        logging.info("not _subset_fast_path and does not need_entries")
+        values = load_generic_metrics(filepath, label_filters=label_filters)
+        values_presorted = True   # load_generic_metrics caches sorted values
 
     if not values:
         print(f"[!] No values found in {filepath}" + (
@@ -1234,94 +1220,50 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         logging.debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
-    if _subset_fast_path:
-        logging.debug("_subset_fast_path")
-        # Values already filtered; stats stored alongside them in the subset cache.
-        subset_stats = _subset.get("stats")
-        if subset_stats:
-            avg   = subset_stats["avg"]
-            stdev = subset_stats["stdev"]
-            cv    = subset_stats["cv"]
-            p50   = subset_stats["p50"]
-            p90   = subset_stats["p90"]
-            p99   = subset_stats["p99"]
-            _info("  (stats cache loaded)")
-        else:
-            # Subset cache exists but lacks stats — compute and patch it.
-            _t0 = time.perf_counter()
-            with _spinner(desc="  Computing stats", show_timer=True):
-                _s = _compute_stats(sorted_vals)
-            _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
-            avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
-                                              _s["p50"], _s["p90"], _s["p99"])
-            _subset["stats"] = {"avg": avg, "stdev": stdev, "cv": cv,
-                                "p50": p50, "p90": p90, "p99": p99}
-            _save_cache(subset_path, _subset)
-        _min = sorted_vals[0] if sorted_vals else None
-        _max = sorted_vals[-1] if sorted_vals else None
+    _t0 = time.perf_counter()
+    cached_stats = _get_cached_stats(cache_path, source_mtime)
+    logging.debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
+    if cached_stats:
+        avg   = cached_stats["avg"]
+        stdev = cached_stats["stdev"]
+        cv    = cached_stats["cv"]
+        p50   = cached_stats["p50"]
+        p90   = cached_stats["p90"]
+        p99   = cached_stats["p99"]
     else:
-        logging.debug("not _subset_fast_path")
-        # --- Unfiltered stats (full dataset) ---
         _t0 = time.perf_counter()
-        cached_stats = _get_cached_stats(cache_path, source_mtime)
-        logging.debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
+        with _spinner(desc="  Computing stats", show_timer=True):
+            _s = _compute_stats(sorted_vals)
+        _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
+        avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
+                                            _s["p50"], _s["p90"], _s["p99"])
+        _t0 = time.perf_counter()
+        _save_stats_to_cache(cache_path, source_mtime, "values", values,
+                                {"avg": avg, "stdev": stdev, "cv": cv,
+                                "p50": p50, "p90": p90, "p99": p99,
+                                "min": _s["min"], "max": _s["max"]})
+        logging.debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
 
-        if cached_stats:
-            avg   = cached_stats["avg"]
-            stdev = cached_stats["stdev"]
-            cv    = cached_stats["cv"]
-            p50   = cached_stats["p50"]
-            p90   = cached_stats["p90"]
-            p99   = cached_stats["p99"]
-            _info("  (stats cache loaded)")
-        else:
-            _t0 = time.perf_counter()
-            with _spinner(desc="  Computing stats", show_timer=True):
-                _s = _compute_stats(sorted_vals)
-            _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
-            avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
-                                              _s["p50"], _s["p90"], _s["p99"])
-            _t0 = time.perf_counter()
-            _save_stats_to_cache(cache_path, source_mtime, "values", values,
-                                 {"avg": avg, "stdev": stdev, "cv": cv,
-                                  "p50": p50, "p90": p90, "p99": p99,
-                                  "min": _s["min"], "max": _s["max"]})
-            logging.debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
-
-        # --- Apply bin filter and build/write subset cache ---
-        # sorted_vals is pre-sorted; bisect finds boundaries in O(log n) rather
-        # than scanning all elements (clip_to_range doesn't know the list is sorted).
-        if min_val is not None or max_val is not None:
-            lo = bisect.bisect_left(sorted_vals, min_val) if min_val is not None else 0
-            hi = bisect.bisect_right(sorted_vals, max_val) if max_val is not None else len(sorted_vals)
-            display_vals = sorted_vals[lo:hi]
-            if display_vals:
-                dn  = len(display_vals)
-                n   = dn
-                _t0 = time.perf_counter()
-                with _spinner(desc="  Computing filtered stats", show_timer=True):
-                    _s = _compute_stats(display_vals)
-                logging.debug(f"  (crunched filtered numbers in {time.perf_counter()-_t0:.1f}s)")
-                avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
-                                                  _s["p50"], _s["p90"], _s["p99"])
-                _min, _max = _s["min"], _s["max"]
-                if subset_path:
-                    _save_cache(subset_path, {
-                        "values": display_vals,
-                        "stats":  {"n": n, "avg": avg, "stdev": stdev, "cv": cv,
-                                   "p50": p50, "p90": p90, "p99": p99,
-                                   "min": _min, "max": _max},
-                    })
-            else:
-                _min = _max = None
-        else:
-            _min = sorted_vals[0] if sorted_vals else None
-            _max = sorted_vals[-1] if sorted_vals else None
+    # If a value range filter is active, recompute display stats on the visible subset.
+    # Cache always stores full-dataset stats; these are display-only overrides.
+    if min_val is not None or max_val is not None:
+        display_vals = clip_to_range(sorted_vals, min_val, max_val)
+        if display_vals:
+            dn    = len(display_vals)
+            n     = dn
+            avg   = statistics.mean(display_vals)
+            stdev = statistics.stdev(display_vals) if dn > 1 else 0.0
+            cv    = round(stdev / avg, 3) if avg else 0.0
+            p50   = statistics.median(display_vals)
+            p90   = statistics.quantiles(display_vals, n=10)[8] if dn >= 10 else display_vals[-1]
+            p99   = statistics.quantiles(display_vals, n=100)[98] if dn >= 100 else display_vals[-1]
+    else:
+        display_vals = sorted_vals
 
     extra = [f"Label filters: {label_filters}"] if label_filters else None
     _print_stats_table(
         f"METRICS: {display_name}", n, avg, stdev, cv, p50, p90, p99,
-        min_val=_min, max_val=_max, extra_lines=extra,
+        min_val=min(display_vals), max_val=max(display_vals), extra_lines=extra,
     )
 
     # Show label cardinality only when --source is explicitly requested.
@@ -1338,11 +1280,11 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     if not no_visuals and plotille:
         # Fast path: sorted_vals is already the filtered subset — no clip needed.
         # Slow path: clip the full sorted_vals to the display range.
-        plot_vals = sorted_vals if _subset_fast_path else clip_to_range(sorted_vals, min_val, max_val)
+        plot_vals = clip_to_range(sorted_vals, min_val, max_val)
         if not plot_vals:
             print(f"  [!] No values in range [{min_val}, {max_val}]")
         else:
-            if not _subset_fast_path and len(plot_vals) < len(sorted_vals):
+            if len(plot_vals) < len(sorted_vals):
                 _info(f"  (showing {len(plot_vals)}/{len(sorted_vals)} values in [{min_val}, {max_val}])")
             _t0 = time.perf_counter()
             _buf = io.StringIO()
@@ -1437,8 +1379,14 @@ if __name__ == "__main__":
                              "(e.g. '2178a534 metrics containerCPU' or 'metrics containerCPU 2178a534').")
 
     args = parser.parse_args()
-    _verbose = args.verbose
-    _quiet   = args.quiet and not args.verbose
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
+        _verbose = args.verbose
+    elif args.quiet:
+        logging.basicConfig(level=logging.WARN, format=LOG_FORMAT)
+        _quiet   = args.quiet and not args.verbose
+    else:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     if args.bucket is not None:
         args.min, args.max = _parse_bucket_arg(args.bucket, "bucket")
     if args.tbucket is not None:
