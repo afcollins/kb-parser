@@ -17,6 +17,12 @@ import statistics
 import sys
 import threading
 import time
+import logging
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)5s %(filename)s:%(lineno)-4d : %(message)s",
+    level=logging.DEBUG
+)
 
 # Attempt to import plotille for terminal visuals
 try:
@@ -66,12 +72,12 @@ _quiet   = False
 def _info(msg):
     """Diagnostic/timing print. Shown by default; suppressed by --quiet."""
     if not _quiet:
-        print(msg)
+        logging.info(msg)
 
 def _debug(msg):
     """Verbose detail. Only shown with --verbose."""
     if _verbose:
-        print(msg)
+        logging.debug(msg)
 
 @contextmanager
 def _spinner(desc="", show_timer=True):
@@ -235,13 +241,6 @@ def _metrics_cache_path(filepath, label_filters=None, min_val=None, max_val=None
     has_bin  = min_val is not None or max_val is not None
     has_time = tmin_sec is not None or tmax_sec is not None
 
-    if not has_bin and not has_time and not latency_key:
-        # Base cache for generic metrics: backward-compatible single-component hash.
-        if label_filters:
-            key = hashlib.md5(str(sorted(label_filters.items())).encode()).hexdigest()[:8]
-            return f"{base}_{key}{ext}"
-        return f"{base}{ext}"
-
     # Full hash: include every active dimension so each combination is unique.
     parts = {}
     if label_filters:
@@ -264,6 +263,7 @@ def _load_cache(cache_path, source_mtime):
     Checks _mem_cache first to avoid re-reading the file within the same run.
     Tries cache_path first; if msgpack path not found, falls back to the
     equivalent .kbcache.json for transparent upgrade of old caches."""
+    logging.info("_load_cache : {cache_path}")
     # In-memory hit: same file, still valid for this source_mtime.
     mem = _mem_cache.get(cache_path)
     if mem is not None and mem[0] >= source_mtime:
@@ -287,7 +287,8 @@ def _load_cache(cache_path, source_mtime):
             if isinstance(data, list):      # upgrade old list format
                 return {"values": data}
             return data if isinstance(data, dict) else None
-        except Exception:
+        except Exception as e:
+            logging.error(f"error loading cache: {e}")
             return None
 
     result = _try(cache_path)
@@ -298,6 +299,7 @@ def _load_cache(cache_path, source_mtime):
     return result
 
 def _save_cache(cache_path, data):
+    logging.debug("_save_cache")
     try:
         fname = os.path.basename(cache_path)
         if cache_path.endswith('.msgpack') and _msgpack:
@@ -310,22 +312,26 @@ def _save_cache(cache_path, data):
                     json.dump(data, f)
         # Keep in-memory cache in sync so subsequent reads in this run see the update.
         _mem_cache[cache_path] = (os.path.getmtime(cache_path), data)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"error saving cache: {e}")
+
 
 def _get_cached_stats(cache_path, source_mtime):
     """Return pre-computed stats dict from cache if present, else None."""
+    logging.debug("_get_cached_stats")
     cached = _load_cache(cache_path, source_mtime)
     return cached.get("stats") if cached else None
 
 def _save_stats_to_cache(cache_path, source_mtime, values_key, values, stats_dict):
     """Persist stats into the cache file."""
+    logging.debug("_save_stats_to_cache")
     try:
         cache_obj = _load_cache(cache_path, source_mtime) or {values_key: values}
         cache_obj["stats"] = stats_dict
         _save_cache(cache_path, cache_obj)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"error saving stats to cache: {e}")
+
 
 
 def load_generic_metrics(filepath, label_filters=None, return_entries=False, need_labels=False):
@@ -341,6 +347,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     need_labels=True forces a full parse even if timestamps are cached, so that the
     returned entries carry their original label dicts (required for --source/-S).
     """
+    logging.debug("load_generic_metrics")
     cache_path = _metrics_cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
 
@@ -350,12 +357,14 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         _elapsed = time.perf_counter() - _t0
         values = cached.get("values", [])
         if not return_entries:
-            _info(f"  (cache loaded in {_elapsed:.1f}s)")
+            logging.info(f"  (cache loaded in {_elapsed:.1f}s)")
             return values
         if not need_labels:
+            logging.debug(f"does not need_labels")
             timestamps = cached.get("timestamps")
             if timestamps is not None and len(timestamps) == len(values):
                 # One-time migration: convert legacy string timestamps to epoch floats.
+                # TODO delete ? We can just delete the cache files.
                 if timestamps and isinstance(timestamps[0], str):
                     _debug(f"  (migrating {len(timestamps):,} string timestamps to epoch floats)")
                     timestamps = [
@@ -363,9 +372,15 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                         for ts in timestamps
                     ]
                     _save_cache(cache_path, {**cached, "timestamps": timestamps})
-                _info(f"  (cache loaded in {_elapsed:.1f}s)")
-                return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
+                    logging.debug(f"cache saved")
+                _t0 = time.perf_counter()
+                tuple = [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
+                _elapsed = time.perf_counter() - _t0
+                logging.debug(f"tuple zipped from cache in {_elapsed:.1f}s")
+                return tuple
         else:
+            logging.debug(f"needs_labels")
+            # TODO Not clear to me why this is needed purely for a `-S`, when cardinality should already be cached.
             # need_labels=True: serve full entries from cache when labels are stored.
             # The base (unfiltered) cache always stores labels; label-filtered caches do not,
             # but those are handled by the warm path below (line ~372).
@@ -373,9 +388,12 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             timestamps = cached.get("timestamps")
             if (labels is not None and timestamps is not None
                     and len(labels) == len(values) and len(timestamps) == len(values)):
-                _info(f"  (cache loaded in {_elapsed:.1f}s)")
-                return [{"timestamp": ts, "value": v, "labels": lab}
+                _t0 = time.perf_counter()
+                triples = [{"timestamp": ts, "value": v, "labels": lab}
                         for ts, v, lab in zip(timestamps, values, labels)]
+                _elapsed = time.perf_counter() - _t0
+                logging.debug(f"values zipped from cache in {_elapsed:.1f}s")
+                return triples
         # Old cache without timestamps/labels — fall through to full parse
 
     # Warm path for label-filtered calls: if the base (unfiltered) kbcache has labels,
@@ -483,6 +501,7 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
     Subset cache for filtered combinations (field_filters + bin + time):
         via _metrics_cache_path() — same pattern as generic metrics.
     """
+    logging.debug("_load_lat_metrics_normalized")
     cache_path   = _metrics_cache_path(lat_path, latency_key=latency_key)
     source_mtime = os.path.getmtime(lat_path)
     _t0 = time.perf_counter()
@@ -656,6 +675,7 @@ def analyze_label_cardinality(entries, top_n=10):
     return {label_key: Counter({label_value: count, ...}), ...}.
     Also prints a human-readable summary, capped at top_n values per label key.
     """
+    logging.debug("analyze_label_cardinality")
     key_counters = defaultdict(Counter)
     for entry in entries:
         labels = entry.get("labels") or {}
@@ -692,6 +712,7 @@ def _print_cardinality(card, top_n=10):
 
 def _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card):
     """Persist cardinality dict into cache['cardinality'][range_key]."""
+    logging.debug("_merge_cardinality_to_cache")
     try:
         cached = _load_cache(cache_path, source_mtime) or {}
         if "cardinality" not in cached:
@@ -699,8 +720,8 @@ def _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card):
         # Convert Counter → plain dict for serialization
         cached["cardinality"][range_key] = {k: dict(v) for k, v in card.items()}
         _save_cache(cache_path, cached)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error("error merging cardinality to cache {e}")
 
 
 _SCATTER_MAX = 1_000_000  # random sample cap for scatter; full fidelity not needed at terminal res
@@ -828,6 +849,7 @@ def _plot_cdf(sorted_vals, title_suffix=""):
 
 def clip_to_range(values, min_val=None, max_val=None):
     """Filter values to [min_val, max_val]. None means no bound."""
+    logging.debug("clip_to_range")
     if min_val is None and max_val is None:
         return values
     return [v for v in values
@@ -836,6 +858,7 @@ def clip_to_range(values, min_val=None, max_val=None):
 
 def clip_entries_to_range(entries, min_val=None, max_val=None):
     """Filter entry dicts to those whose 'value' falls in [min_val, max_val]."""
+    logging.debug("clip_entries_to_range")
     if min_val is None and max_val is None:
         return entries
     return [e for e in entries
@@ -846,6 +869,7 @@ def clip_entries_to_range(entries, min_val=None, max_val=None):
 def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
     """Filter entry dicts to those whose timestamp falls within [tmin_sec, tmax_sec]
     elapsed seconds from the first timestamp in the dataset. None means no bound."""
+    logging.debug("clip_entries_to_time_range")
     if tmin_sec is None and tmax_sec is None:
         return entries
     timestamps = []
@@ -1042,7 +1066,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     card = analyze_label_cardinality(
                         clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
                     _merge_cardinality_to_cache(cache_path_s, source_mtime_s, range_key, card)
-        except Exception as e: print(f"  [!] Metrics JSON Error: {e}")
+        except Exception as e: logging.error(f"  [!] Metrics JSON Error: {e}")
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
 
@@ -1101,12 +1125,13 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     if not os.path.isfile(filepath):
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
-
+    logging.info("run_generic_metrics_analysis")
     # Raw entries (with timestamps) are needed for scatter (--scatter), label source
     # lookup (--source), or time filtering.  Histogram and CDF run from cached values
     # alone, so the default path hits the cache without touching the source file.
     cache_path = _metrics_cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
+    logging.info(f"_metrics_cache_path: {cache_path}")
 
     # Pre-check cardinality cache so we avoid forcing a cold source parse just for
     # -S when the result is already stored.  need_labels stays False on a warm hit.
@@ -1117,14 +1142,14 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     need_labels = source and cached_card is None
     need_entries = scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
+    logging.debug(f"need_entries={need_entries}")
 
     # Subset cache: one small file per unique (label + bin + time) filter combo.
     # On a warm hit we skip load_generic_metrics entirely — no 4-second main cache load.
     # Only applies when full entries aren't needed (scatter/source/time-filter set need_entries).
     has_subset_filters = (min_val is not None or max_val is not None or
                           tmin_sec is not None or tmax_sec is not None)
-    subset_path = (_metrics_cache_path(filepath, label_filters, min_val, max_val, tmin_sec, tmax_sec)
-                   if has_subset_filters else None)
+    subset_path = cache_path if has_subset_filters else None
     _subset = None
     _subset_fast_path = False
     if subset_path and not need_entries:
@@ -1139,6 +1164,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if not _subset_fast_path:
         if need_entries:
+            logging.info("not _subset_fast_path and does need_entries")
             entries = load_generic_metrics(filepath, label_filters=label_filters,
                                            return_entries=True, need_labels=need_labels)
             if tmin_sec is not None or tmax_sec is not None:
@@ -1177,12 +1203,13 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
             _t0 = time.perf_counter()
             values = [e["value"] for e in entries]
-            _debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
+            logging.debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
             # Pre-sorted when entries came from cache in value order (no time-filter, no
             # cold label parse). Time-filter picks a non-contiguous subset; a cold
             # need_labels parse returns file order — neither is guaranteed sorted.
             values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
         else:
+            logging.info("not _subset_fast_path and does not need_entries")
             values = load_generic_metrics(filepath, label_filters=label_filters)
             values_presorted = True   # load_generic_metrics caches sorted values
 
@@ -1192,6 +1219,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         ), file=sys.stderr)
         return
 
+    # TODO delete metric_name as is unused
     display_name = metric_name or os.path.basename(filepath)
     title_suffix = f" — {display_name}" if display_name else ""
     if label_filters:
@@ -1199,14 +1227,15 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
 
     if values_presorted:
         sorted_vals = values
-        _debug(f"  (skipped sort — {len(sorted_vals):,} values pre-sorted from cache)")
+        logging.debug(f"  (skipped sort — {len(sorted_vals):,} values pre-sorted from cache)")
     else:
         _t0 = time.perf_counter()
         sorted_vals = sorted(values)
-        _debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
+        logging.debug(f"  (sorted {len(sorted_vals):,} values in {time.perf_counter()-_t0:.2f}s)")
     n = len(sorted_vals)
 
     if _subset_fast_path:
+        logging.debug("_subset_fast_path")
         # Values already filtered; stats stored alongside them in the subset cache.
         subset_stats = _subset.get("stats")
         if subset_stats:
@@ -1231,10 +1260,11 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         _min = sorted_vals[0] if sorted_vals else None
         _max = sorted_vals[-1] if sorted_vals else None
     else:
+        logging.debug("not _subset_fast_path")
         # --- Unfiltered stats (full dataset) ---
         _t0 = time.perf_counter()
         cached_stats = _get_cached_stats(cache_path, source_mtime)
-        _debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
+        logging.debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
 
         if cached_stats:
             avg   = cached_stats["avg"]
@@ -1256,7 +1286,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                                  {"avg": avg, "stdev": stdev, "cv": cv,
                                   "p50": p50, "p90": p90, "p99": p99,
                                   "min": _s["min"], "max": _s["max"]})
-            _debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
+            logging.debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
 
         # --- Apply bin filter and build/write subset cache ---
         # sorted_vals is pre-sorted; bisect finds boundaries in O(log n) rather
@@ -1271,7 +1301,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _t0 = time.perf_counter()
                 with _spinner(desc="  Computing filtered stats", show_timer=True):
                     _s = _compute_stats(display_vals)
-                _info(f"  (crunched filtered numbers in {time.perf_counter()-_t0:.1f}s)")
+                logging.debug(f"  (crunched filtered numbers in {time.perf_counter()-_t0:.1f}s)")
                 avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
                                                   _s["p50"], _s["p90"], _s["p99"])
                 _min, _max = _s["min"], _s["max"]
@@ -1299,7 +1329,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     # so a warm cache hit avoids re-reading the source file entirely.
     if source:
         if cached_card:
-            _info("  (cardinality cache loaded)")
+            logging.info("  (cardinality cache loaded)")
             _print_cardinality(cached_card, top_n=top_labels)
         elif entries is not None:
             card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
@@ -1326,10 +1356,10 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             print(_buf.getvalue(), end="")
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
-                _info(f"  (built graphs in {_elapsed:.1f}s)")
+                logging.info(f"  (built graphs in {_elapsed:.1f}s)")
     elif no_visuals:
-        _info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
-    _info("  (analysis complete)")
+        logging.info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
+    logging.info("  (analysis complete)")
 
 
 def _classify_cv(cv):
@@ -1469,6 +1499,7 @@ if __name__ == "__main__":
             sys.exit(1)
         for raw_file in metric_files:
             metric_file = raw_file if raw_file.endswith(".json") else raw_file + ".json"
+            # TODO remove metric_name
             display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
             for pair in discovered_pairs:
                 if not pair.get("metrics_dir"):
