@@ -365,7 +365,18 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                     _save_cache(cache_path, {**cached, "timestamps": timestamps})
                 _info(f"  (cache loaded in {_elapsed:.1f}s)")
                 return [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
-        # need_labels=True, or old cache without timestamps — fall through to full parse
+        else:
+            # need_labels=True: serve full entries from cache when labels are stored.
+            # The base (unfiltered) cache always stores labels; label-filtered caches do not,
+            # but those are handled by the warm path below (line ~372).
+            labels = cached.get("labels")
+            timestamps = cached.get("timestamps")
+            if (labels is not None and timestamps is not None
+                    and len(labels) == len(values) and len(timestamps) == len(values)):
+                _info(f"  (cache loaded in {_elapsed:.1f}s)")
+                return [{"timestamp": ts, "value": v, "labels": lab}
+                        for ts, v, lab in zip(timestamps, values, labels)]
+        # Old cache without timestamps/labels — fall through to full parse
 
     # Warm path for label-filtered calls: if the base (unfiltered) kbcache has labels,
     # filter in memory rather than re-reading the source file.
