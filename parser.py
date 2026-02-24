@@ -699,28 +699,35 @@ _CDF_MAX     = 2_000   # monotone CDF needs ~2k points for smooth 70×12 renderi
 def _plot_metrics_scatter(entries, title_suffix="", t0=None, min_val=0):
     """Plot value over elapsed time for generic metric entries (timestamp + value).
 
-    t0: optional datetime anchor for the X-axis origin. When provided (e.g. from
-    the full unclipped dataset), elapsed seconds are computed relative to it so
-    the X-axis position is preserved after time-range filtering.
+    t0: optional epoch-float anchor for the X-axis origin. When provided (e.g.
+    from the full unclipped dataset), elapsed seconds are computed relative to it
+    so the X-axis position is preserved after time-range filtering.
+
+    Timestamps in entries are used as epoch floats when available (cache path),
+    falling back to _parse_timestamp() for legacy string-timestamp entries.
     """
     n_orig = len(entries)
     if n_orig > _SCATTER_MAX:
         entries = random.sample(entries, _SCATTER_MAX)
     data_points = []
     for entry in entries:
-        ts_raw = entry.get("timestamp", "")
+        ts_raw = entry.get("timestamp")
         val = entry.get("value")
-        if not ts_raw or val is None:
+        if ts_raw is None or val is None:
             continue
-        ts = _parse_timestamp(ts_raw)
-        if ts is None:
-            continue
-        data_points.append((ts, float(val)))
+        if isinstance(ts_raw, (int, float)):
+            ts_epoch = float(ts_raw)
+        else:
+            dt = _parse_timestamp(ts_raw)
+            if dt is None:
+                continue
+            ts_epoch = dt.timestamp()
+        data_points.append((ts_epoch, float(val)))
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
-    start_t = t0 if t0 is not None else data_points[0][0]
-    x_secs = [(p[0] - start_t).total_seconds() for p in data_points]
+    t0_epoch = t0 if t0 is not None else data_points[0][0]
+    x_secs = [p[0] - t0_epoch for p in data_points]
     y_vals = [p[1] for p in data_points]
     title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
     print(f"\n{title}")
@@ -935,6 +942,16 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                 sorted_vals = [e["value"] for e in entries]
                 n_vals = len(sorted_vals)
 
+                # When time-clipping, anchor the scatter X-axis to the start of the
+                # full (unfiltered) dataset so the displayed window position is
+                # preserved — matching the behaviour of run_generic_metrics_analysis().
+                scatter_t0 = None
+                if tmin_sec is not None or tmax_sec is not None:
+                    base_cache_path = _metrics_cache_path(lat_path, latency_key=latency_key)
+                    base_cached = _load_cache(base_cache_path, os.path.getmtime(lat_path))
+                    if base_cached and "timestamps" in base_cached:
+                        scatter_t0 = min(base_cached["timestamps"])
+
                 if not no_visuals and plotille:
                     _t0 = time.perf_counter()
                     plot_vals = sorted_vals  # already clipped via _load_lat_metrics_normalized
@@ -945,7 +962,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                             print(f"\n\033[1;34m" + "="*25
                                   + f" VISUALS: {data['scheduler']} {pair['fragment']} "
                                   + "="*25 + "\033[0m")
-                            _plot_metrics_scatter(entries, title_suffix=latency_key)
+                            _plot_metrics_scatter(entries, title_suffix=latency_key,
+                                                  t0=scatter_t0, min_val=min_val or 0)
                             if min_val is not None or max_val is not None:
                                 _plot_histogram_plotille(plot_vals, f'{latency_key} Zoomed')
                             else:
@@ -1133,7 +1151,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                 _t0 = time.perf_counter()
                 if ts_list:
                     t0_epoch = min(ts_list)
-                    scatter_t0 = datetime.datetime.fromtimestamp(t0_epoch, tz=datetime.timezone.utc)
+                    scatter_t0 = t0_epoch
                     entries = [
                         e for e, ts in zip(entries, ts_list)
                         if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
