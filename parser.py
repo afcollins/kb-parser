@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
+from dataclasses import dataclass
 import io
 import datetime
 import enum
@@ -17,6 +18,19 @@ import sys
 import threading
 import time
 import logging
+
+
+@dataclass
+class RenderConfig:
+    """Groups all display/render CLI flags so they can be passed as one object."""
+    no_visuals: bool = False
+    scatter:    bool = False
+    source:     bool = False
+    top_labels: int  = 10
+    agg:        bool = False
+    plotly:     bool = False
+    no_hist:    bool = False
+    no_cdf:     bool = False
 # plotly.express for scatter with marginal distributions
 # import plotly.express as px
 # Attempt to import plotille for terminal visuals
@@ -818,8 +832,10 @@ def _print_stats_table(title, n, avg, stdev, cv, p50, p90, p99,
     print("\033[1;34m" + "=" * 110 + "\033[0m")
 
 
-def _plot_frequency_histogram(sorted_lats):
+def _plot_frequency_histogram(sorted_lats, cfg):
     """Plot snap-to-grid frequency histogram of scheduling latencies (clean ms boundaries)."""
+    if cfg.no_hist:
+        return
     lats_min, lats_max = min(sorted_lats), max(sorted_lats)
     step = get_pretty_step(lats_max - lats_min)
     snapped_data = [math.floor(x / step) * step for x in sorted_lats]
@@ -838,18 +854,18 @@ def _plot_frequency_histogram(sorted_lats):
         curr += step
 
 
-def _plot_histogram_plotille(sorted_vals, title_suffix="", bins=20):
+def _plot_histogram_plotille(sorted_vals, cfg, title_suffix="", bins=20):
     """Plot frequency histogram using plotille (for generic metric values)."""
-    if not sorted_vals:
+    if cfg.no_hist or not sorted_vals:
         return
     title = f"[ Frequency Histogram {title_suffix} ]".strip()
     print(f"\n{title}")
     print(plotille.hist(sorted_vals, bins=bins))
 
 
-def _plot_cdf(sorted_vals, title_suffix=""):
+def _plot_cdf(sorted_vals, cfg, title_suffix=""):
     """Plot cumulative distribution (CDF) for any sorted numeric values."""
-    if not sorted_vals:
+    if cfg.no_cdf or not sorted_vals:
         return
     title = f"[ Cumulative Distribution (CDF) {title_suffix} ]".strip()
     print(f"\n{title}")
@@ -979,17 +995,17 @@ def _plot_plotly(series, agg=False, title_suffix="", output_html=None):
     fig.show()
 
 
-def _render_plots_plotly(series, agg, title_suffix):
+def _render_plots_plotly(series, cfg, title_suffix):
     """Dispatch to _plot_plotly; exists so call sites read as a single verb."""
-    _plot_plotly(series, agg=agg, title_suffix=title_suffix)
+    _plot_plotly(series, agg=cfg.agg, title_suffix=title_suffix)
 
 
-def _render_plots_plotille_agg(series, title_suffix="", min_val=None, max_val=None,
-                                use_pretty_hist=False):
+def _render_plots_plotille_agg(series, cfg, title_suffix="", min_val=None, max_val=None):
     """Render aggregated plotille scatter + histogram + CDF from a multi-fragment series list."""
     if not plotille or not series:
         return
     all_vals = sorted(v for s in series for v in s["sorted_vals"])
+    use_pretty_hist = (min_val is None and max_val is None)
     _buf = io.StringIO()
     _buf.isatty = sys.stdout.isatty
     with _spinner(desc="  Building graphs"):
@@ -998,20 +1014,20 @@ def _render_plots_plotille_agg(series, title_suffix="", min_val=None, max_val=No
             print(f"\n\033[1;34m{'='*25} VISUALS: AGGREGATED ({n} fragments) {'='*25}\033[0m")
             _plot_multi_scatter(series, title_suffix=title_suffix, min_val=min_val or 0)
             if use_pretty_hist:
-                _plot_frequency_histogram(all_vals)
+                _plot_frequency_histogram(all_vals, cfg)
             else:
-                _plot_histogram_plotille(all_vals, title_suffix)
-            _plot_cdf(all_vals, title_suffix)
+                _plot_histogram_plotille(all_vals, cfg, title_suffix)
+            _plot_cdf(all_vals, cfg, title_suffix)
             print("\033[1;34m" + "="*70 + "\033[0m\n")
     print(_buf.getvalue(), end="")
 
 
-def _render_plots_plotille_single(entries, plot_vals, title_suffix="", scatter_t0=None,
-                                   min_val=None, max_val=None, use_pretty_hist=False,
-                                   header=""):
+def _render_plots_plotille_single(entries, plot_vals, cfg, title_suffix="", scatter_t0=None,
+                                   min_val=None, max_val=None, header=""):
     """Render single-fragment plotille scatter + histogram + CDF."""
     if not plotille:
         return
+    use_pretty_hist = (min_val is None and max_val is None)
     _buf = io.StringIO()
     _buf.isatty = sys.stdout.isatty
     with _spinner(desc="  Building graphs"):
@@ -1021,16 +1037,16 @@ def _render_plots_plotille_single(entries, plot_vals, title_suffix="", scatter_t
             _plot_metrics_scatter(entries, title_suffix=title_suffix,
                                   t0=scatter_t0, min_val=min_val or 0)
             if use_pretty_hist:
-                _plot_frequency_histogram(plot_vals)
+                _plot_frequency_histogram(plot_vals, cfg)
             else:
-                _plot_histogram_plotille(plot_vals, title_suffix)
-            _plot_cdf(plot_vals, title_suffix)
+                _plot_histogram_plotille(plot_vals, cfg, title_suffix)
+            _plot_cdf(plot_vals, cfg, title_suffix)
             if header:
                 print("\033[1;34m" + "="*70 + "\033[0m\n")
     print(_buf.getvalue(), end="")
 
 
-def _render_metrics_plotille_agg(series, display_base, min_val, max_val, show_scatter):
+def _render_metrics_plotille_agg(series, cfg, display_base, min_val, max_val):
     """Aggregate plotille histogram + CDF (and optional scatter) for metrics mode."""
     if not plotille or not series:
         return
@@ -1042,12 +1058,12 @@ def _render_metrics_plotille_agg(series, display_base, min_val, max_val, show_sc
     _buf.isatty = sys.stdout.isatty
     with _spinner(desc="  Building graphs"):
         with redirect_stdout(_buf):
-            if show_scatter:
+            if cfg.scatter:
                 scatter_series = [s for s in series if s.get("entries")]
                 if scatter_series:
                     _plot_multi_scatter(scatter_series, title_suffix=display_base)
-            _plot_histogram_plotille(all_vals, f"AGGREGATED — {display_base}")
-            _plot_cdf(all_vals, f"AGGREGATED — {display_base}")
+            _plot_histogram_plotille(all_vals, cfg, f"AGGREGATED — {display_base}")
+            _plot_cdf(all_vals, cfg, f"AGGREGATED — {display_base}")
     print(_buf.getvalue(), end="")
 
 
@@ -1094,10 +1110,9 @@ def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
 
 
 
-def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None,
+def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                        latency_key="podReadyLatency", field_filters=None,
-                       source=False, top_labels=10, tmin_sec=None, tmax_sec=None,
-                       agg=False, plotly_mode=False):
+                       tmin_sec=None, tmax_sec=None):
     if not uuid_fragments:
         print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
@@ -1209,15 +1224,13 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                 })
 
                 # Per-fragment plotille plots — skipped when --agg or --plotly is active.
-                if not no_visuals and plotille and not agg and not plotly_mode:
+                if not cfg.no_visuals and plotille and not cfg.agg and not cfg.plotly:
                     _t0 = time.perf_counter()
-                    use_pretty = (min_val is None and max_val is None)
                     _render_plots_plotille_single(
-                        entries, plot_vals,
+                        entries, plot_vals, cfg,
                         title_suffix=latency_key,
                         scatter_t0=scatter_t0,
                         min_val=min_val, max_val=max_val,
-                        use_pretty_hist=use_pretty,
                         header=f"{data['scheduler']} {pair['fragment']}",
                     )
                     _elapsed = time.perf_counter() - _t0
@@ -1272,7 +1285,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                 logging.debug(f"{data}")
                 data['sched_stddev'] = data['stddev'] if data['stddev'] is not None else DEFAULT_VAL
 
-            if source:
+            if cfg.source:
                 range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
                 cache_path_s = _metrics_cache_path(lat_path, latency_key=latency_key)
                 source_mtime_s = os.path.getmtime(lat_path)
@@ -1280,11 +1293,11 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     "cardinality", {}).get(range_key)
                 if cached_card:
                     _info("  (cardinality cache loaded)")
-                    _print_cardinality(cached_card, top_n=top_labels)
+                    _print_cardinality(cached_card, top_n=cfg.top_labels)
                 elif entries is not None:
                     # entries already have "labels" — no second parse needed.
                     card = analyze_label_cardinality(
-                        clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
+                        clip_entries_to_range(entries, min_val, max_val), top_n=cfg.top_labels)
                     _merge_cardinality_to_cache(cache_path_s, source_mtime_s, range_key, card)
         except Exception as e: logging.error(f"  [!] Metrics JSON Error: {e}")
 
@@ -1292,15 +1305,13 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
 
     # Post-loop: aggregate or plotly rendering (--agg / --plotly)
-    if not no_visuals and fragment_series:
-        use_pretty = (min_val is None and max_val is None)
-        if plotly_mode:
-            _render_plots_plotly(fragment_series, agg=agg, title_suffix=latency_key)
-        elif agg:
+    if not cfg.no_visuals and fragment_series:
+        if cfg.plotly:
+            _render_plots_plotly(fragment_series, cfg, title_suffix=latency_key)
+        elif cfg.agg:
             _render_plots_plotille_agg(
-                fragment_series, title_suffix=latency_key,
+                fragment_series, cfg, title_suffix=latency_key,
                 min_val=min_val, max_val=max_val,
-                use_pretty_hist=use_pretty,
             )
         # else: already rendered per-fragment inside the loop above
 
@@ -1347,10 +1358,9 @@ def _compute_stats(sorted_vals):
             "min": sorted_vals[0], "max": sorted_vals[-1]}
 
 
-def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
-                                  no_visuals=False, min_val=None, max_val=None,
-                                  scatter=False, source=False, tmin_sec=None, tmax_sec=None,
-                                  top_labels=10, _collect=False):
+def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=None,
+                                  min_val=None, max_val=None,
+                                  tmin_sec=None, tmax_sec=None, _collect=False):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -1375,11 +1385,11 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     # -S when the result is already stored.  need_labels stays False on a warm hit.
     range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
     cached_card = None
-    if source:
+    if cfg.source:
         cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
 
-    need_labels = source and cached_card is None
-    need_entries = scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
+    need_labels = cfg.source and cached_card is None
+    need_entries = cfg.scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
     logging.debug(f"need_entries={need_entries}")
 
     entries = None
@@ -1504,12 +1514,12 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
     # Show label cardinality only when --source is explicitly requested.
     # range_key and cached_card were computed before the load_generic_metrics call
     # so a warm cache hit avoids re-reading the source file entirely.
-    if source:
+    if cfg.source:
         if cached_card:
             logging.info("  (cardinality cache loaded)")
-            _print_cardinality(cached_card, top_n=top_labels)
+            _print_cardinality(cached_card, top_n=cfg.top_labels)
         elif entries is not None:
-            card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
+            card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=cfg.top_labels)
             _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
 
     if _collect:
@@ -1517,7 +1527,7 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
         logging.info("  (analysis complete — data returned for aggregation)")
         return sorted_vals, entries, scatter_t0
 
-    if not no_visuals and plotille:
+    if not cfg.no_visuals and plotille:
         # Fast path: sorted_vals is already the filtered subset — no clip needed.
         # Slow path: clip the full sorted_vals to the display range.
         plot_vals = clip_to_range(sorted_vals, min_val, max_val)
@@ -1531,15 +1541,15 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             _buf.isatty = sys.stdout.isatty  # preserve TTY status so plotille emits ANSI colours
             with _spinner(desc="  Building graphs"):
                 with redirect_stdout(_buf):
-                    if scatter and entries is not None:
+                    if cfg.scatter and entries is not None:
                         _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0, min_val=min_val)
-                    _plot_histogram_plotille(plot_vals, title_suffix=title_suffix)
-                    _plot_cdf(plot_vals, title_suffix=title_suffix)
+                    _plot_histogram_plotille(plot_vals, cfg, title_suffix=title_suffix)
+                    _plot_cdf(plot_vals, cfg, title_suffix=title_suffix)
             print(_buf.getvalue(), end="")
             _elapsed = time.perf_counter() - _t0
             if _elapsed > 0.5:
                 logging.info(f"  (built graphs in {_elapsed:.1f}s)")
-    elif no_visuals:
+    elif cfg.no_visuals:
         logging.info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
     logging.info("  (analysis complete)")
 
@@ -1617,6 +1627,10 @@ if __name__ == "__main__":
     parser.add_argument("--plotly", action="store_true",
                         help="Use plotly interactive HTML output (opens in browser) instead of "
                              "plotille terminal plots. Compatible with --agg.")
+    parser.add_argument("--no-hist", action="store_true",
+                        help="Suppress the frequency histogram plot.")
+    parser.add_argument("--no-cdf", action="store_true",
+                        help="Suppress the CDF plot.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show all timing detail including intermediate steps.")
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -1640,6 +1654,18 @@ if __name__ == "__main__":
         args.tmin, args.tmax = _parse_bucket_arg(args.tbucket, "tbucket")
     else:
         args.tmin = args.tmax = None
+
+    cfg = RenderConfig(
+        no_visuals=args.no_visuals,
+        scatter=args.scatter,
+        source=args.source,
+        top_labels=args.top_labels,
+        agg=args.agg,
+        plotly=args.plotly,
+        no_hist=args.no_hist,
+        no_cdf=args.no_cdf,
+    )
+
     positionals = args.positionals
 
     if not positionals:
@@ -1681,13 +1707,10 @@ if __name__ == "__main__":
                 label_filters[k.strip()] = v.strip()
 
     if fragments and not run_metrics:
-        process_automation(fragments, no_visuals=args.no_visuals, min_val=args.min, max_val=args.max,
+        process_automation(fragments, cfg, min_val=args.min, max_val=args.max,
                            latency_key=args.latency_type,
                            field_filters=label_filters or None,
-                           source=args.source,
-                           top_labels=args.top_labels,
-                           tmin_sec=args.tmin, tmax_sec=args.tmax,
-                           agg=args.agg, plotly_mode=args.plotly)
+                           tmin_sec=args.tmin, tmax_sec=args.tmax)
 
     if run_metrics and metric_files:
         if not discovered_pairs:
@@ -1710,16 +1733,14 @@ if __name__ == "__main__":
                 if use_agg_path:
                     result = run_generic_metrics_analysis(
                         filepath,
+                        RenderConfig(no_visuals=True, scatter=cfg.scatter,
+                                     source=cfg.source, top_labels=cfg.top_labels),
                         metric_name=metric_name,
                         label_filters=label_filters or None,
-                        no_visuals=True,
                         min_val=args.min,
                         max_val=args.max,
-                        scatter=args.scatter,
-                        source=args.source,
                         tmin_sec=args.tmin,
                         tmax_sec=args.tmax,
-                        top_labels=args.top_labels,
                         _collect=True,
                     )
                     if result:
@@ -1732,25 +1753,21 @@ if __name__ == "__main__":
                         })
                 else:
                     run_generic_metrics_analysis(
-                        filepath,
+                        filepath, cfg,
                         metric_name=metric_name,
                         label_filters=label_filters or None,
-                        no_visuals=args.no_visuals,
                         min_val=args.min,
                         max_val=args.max,
-                        scatter=args.scatter,
-                        source=args.source,
                         tmin_sec=args.tmin,
                         tmax_sec=args.tmax,
-                        top_labels=args.top_labels,
                     )
 
-            if use_agg_path and not args.no_visuals and agg_series:
-                if args.plotly:
-                    _render_plots_plotly(agg_series, agg=args.agg, title_suffix=display_base)
+            if use_agg_path and not cfg.no_visuals and agg_series:
+                if cfg.plotly:
+                    _render_plots_plotly(agg_series, cfg, title_suffix=display_base)
                 else:
                     _render_metrics_plotille_agg(
-                        agg_series, display_base, args.min, args.max, args.scatter
+                        agg_series, cfg, display_base, args.min, args.max
                     )
     _t0 = time.perf_counter()
     _mem_cache.clear()
