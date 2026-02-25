@@ -144,8 +144,10 @@ QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
 # We define the order by finding 'job_took' and inserting the percentiles right after it
 ORIGINAL_COLUMNS = [
     "OCP Version", "k-b version", "workers", "workload", "scheduler",
-    "iterations", "podReplicas", "start time", "UUID", "p99",
-    "max", "avg", "stddev", "end time", "percent", "duration", "cycles", "job_took",
+    "iterations", "podReplicas", "start time", "UUID",
+    "sched_p99", "sched_max", "sched_avg", "sched_stddev",
+    "ready_p99", "ready_max", "ready_avg",
+    "end time", "percent", "duration", "cycles", "job_took",
     "Note", "worker reserved cores", "worker CPUs", "topologyPolicy", "overall duration",
     "qps burst", "CV"
 ]
@@ -918,12 +920,13 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
             with open(pair['log_path'], 'r') as f:
                 lines = f.readlines()
                 if lines:
-                    data['start time'] = parse_logfmt_line(lines[0]).get('time', DEFAULT_VAL)
                     data['end time'] = parse_logfmt_line(lines[-1]).get('time', DEFAULT_VAL)
                     for line in lines:
                         parsed = parse_logfmt_line(line)
                         msg = parsed.get('msg', '')
                         if "Starting kube-burner" in msg:
+                            # timestamp from Starting kube-burner should work. End time can stay as the last line, in the event it times out
+                            data['start time'] = parsed.get('time', DEFAULT_VAL)
                             u_match = re.search(r"UUID ([a-f0-9\-]+)", msg)
                             v_match = re.search(r"\((.*?)\)", msg)
                             if u_match: data['UUID'] = u_match.group(1)
@@ -933,7 +936,11 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                             if d_match: data['job_took'] = d_match.group(1)
                         if "PodScheduled" in msg:
                             m = extract_log_metrics(msg)
-                            data.update({'p99': m['p99'], 'max': m['max'], 'avg': m['avg']})
+                            data.update({'sched_p99': m['p99'], 'sched_max': m['max'], 'sched_avg': m['avg']})
+                        if "ContainersReady" in msg:
+                            logging.debug(f"Ready matched on: {msg}")
+                            m = extract_log_metrics(msg)
+                            data.update({'ready_p99': m['p99'], 'ready_max': m['max'], 'ready_avg': m['avg']})
         except Exception as e:
             print(f"  [!] Log Error: {e}")
 
@@ -1070,6 +1077,11 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                         clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
                     _merge_cardinality_to_cache(cache_path_s, source_mtime_s, range_key, card)
         except Exception as e: logging.error(f"  [!] Metrics JSON Error: {e}")
+
+        # Not the cleanest, but cached stats are separated by latency type, so we
+        # simply append the column for CSV prior to printing time
+        if latency_key == LatencyType.schedulingLatency.value:
+            data['sched_stddev'] = data['stddev']
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
 
