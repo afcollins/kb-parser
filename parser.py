@@ -1168,6 +1168,7 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                 summary_data = json.load(f)[0]
                 data.update({
                     'OCP Version': summary_data.get('ocpVersion', DEFAULT_VAL),
+                    'Note': summary_data.get('workloadMods', DEFAULT_VAL),
                     'scheduler': summary_data.get('scheduler', DEFAULT_VAL),
                     'podReplicas': summary_data.get('podReplicas', DEFAULT_VAL),
                     'workers': summary_data.get('otherNodesCount', 0),
