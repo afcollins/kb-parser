@@ -17,13 +17,23 @@ import sys
 import threading
 import time
 import logging
-
+# plotly.express for scatter with marginal distributions
+# import plotly.express as px
 # Attempt to import plotille for terminal visuals
 try:
     import plotille
 except ImportError:
     print("[!] Run 'pip install plotille' to enable terminal graphing.")
     plotille = None
+
+# Attempt to import plotly for browser visuals
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:
+    print("[!] Run 'pip install plotly' to enable interactive browser graphing.")
+    go = None
+    make_subplots = None
 
 # Use orjson for faster JSON parsing of large metric files when available.
 # orjson only provides loads()/dumps() (not load()/dump()), so it is used
@@ -507,7 +517,7 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
     Subset cache for filtered combinations (field_filters + bin + time):
         via _metrics_cache_path() — same pattern as generic metrics.
     """
-    logging.debug("_load_lat_metrics_normalized")
+    logging.debug(f"_load_lat_metrics_normalized min,max {min_val},{max_val}")
     cache_path   = _metrics_cache_path(lat_path, latency_key=latency_key)
     source_mtime = os.path.getmtime(lat_path)
     _t0 = time.perf_counter()
@@ -732,6 +742,11 @@ def _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card):
 _SCATTER_MAX = 1_000_000  # random sample cap for scatter; full fidelity not needed at terminal res
 _CDF_MAX     = 2_000   # monotone CDF needs ~2k points for smooth 70×12 rendering
 
+# Color cycles for multi-fragment series (plotille terminal and plotly browser)
+_SERIES_COLORS = ["cyan", "green", "magenta", "yellow", "red", "blue", "white"]
+_PLOTLY_COLORS = ["#00bcd4", "#4caf50", "#e91e63", "#ff9800", "#f44336", "#2196f3", "#9c27b0"]
+_PLOTLY_OUTPUT = "kube-burner-ocp-report.html"
+
 
 def _plot_metrics_scatter(entries, title_suffix="", t0=None, min_val=0):
     """Plot value over elapsed time for generic metric entries (timestamp + value).
@@ -852,9 +867,192 @@ def _plot_cdf(sorted_vals, title_suffix=""):
     print(fig.show())
 
 
+def _plot_multi_scatter(series, title_suffix="", min_val=0):
+    """Overlay multiple fragment scatter series on one plotille terminal figure.
+
+    series: list of {"entries": [...], "label": str, "color": str}
+    Each series normalizes time to elapsed seconds from its own earliest timestamp
+    so all runs overlap on a common 0-relative axis for easy comparison.
+    """
+    if not plotille or not series:
+        return
+    fig = plotille.Figure()
+    fig.width, fig.height = 70, 12
+    fig.set_y_limits(min_=min_val)
+    all_x = []
+    for s in series:
+        entries = s["entries"]
+        if not entries:
+            continue
+        if len(entries) > _SCATTER_MAX:
+            entries = random.sample(entries, _SCATTER_MAX)
+        t0 = min(e["timestamp"] for e in entries)
+        x_secs = [e["timestamp"] - t0 for e in entries]
+        y_vals = [e["value"] for e in entries]
+        all_x.extend(x_secs)
+        fig.scatter(x_secs, y_vals, lc=s["color"], label=s["label"])
+    if not all_x:
+        return
+    fig.set_x_limits(min_=min(all_x), max_=max(all_x))
+    title = f"[ Metrics Scatter — AGGREGATED{(' ' + title_suffix) if title_suffix else ''} ]"
+    print(f"\n{title}")
+    print(fig.show())
+
+
+def _plot_plotly(series, agg=False, title_suffix="", output_html=None):
+    """Generate interactive plotly figure with scatter / histogram / CDF subplots.
+
+    series: list of {"entries": [...], "sorted_vals": [...], "label": str}
+    agg: if True, all series data is merged into single traces;
+         if False, each fragment gets its own named, toggle-able trace.
+    Writes a self-contained HTML file and opens it in the default browser.
+    """
+    if not go:
+        return
+    out = output_html or _PLOTLY_OUTPUT
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=[
+            f"Scatter — {title_suffix}",
+            f"Histogram — {title_suffix}",
+            f"CDF — {title_suffix}",
+        ],
+        vertical_spacing=0.1,
+    )
+    colors = _PLOTLY_COLORS
+
+    if agg:
+        all_vals = sorted(v for s in series for v in s["sorted_vals"])
+        all_entries = [e for s in series for e in (s.get("entries") or [])]
+        if all_entries:
+            t0 = min(e["timestamp"] for e in all_entries)
+            x_secs = [e["timestamp"] - t0 for e in all_entries]
+            y_vals = [e["value"] for e in all_entries]
+            fig.add_trace(go.Scatter(x=x_secs, y=y_vals, mode="markers",
+                                     name="All Fragments",
+                                     marker=dict(color=colors[0], size=3)),
+                          row=1, col=1)
+        fig.add_trace(go.Histogram(x=all_vals, name="All Fragments",
+                                   marker_color=colors[0], opacity=0.8),
+                      row=2, col=1)
+        n = len(all_vals)
+        step = max(1, n // _CDF_MAX)
+        fig.add_trace(go.Scatter(x=all_vals[::step],
+                                  y=[i / n for i in range(0, n, step)],
+                                  mode="lines", name="All Fragments", showlegend=False),
+                      row=3, col=1)
+    else:
+        for i, s in enumerate(series):
+            color = colors[i % len(colors)]
+            label = s["label"]
+            entries = s.get("entries") or []
+            vals = s["sorted_vals"]
+            if entries:
+                t0 = min(e["timestamp"] for e in entries)
+                x_secs = [e["timestamp"] - t0 for e in entries]
+                y_vals = [e["value"] for e in entries]
+                # TODO marginal_x/y are neat, but plotly express and cannot be used in subplots.
+                # fig = px.scatter(x=x_secs, y=y_vals, marginal_x="histogram", marginal_y="rug", labels=label)
+                fig.add_trace(go.Scatter(x=x_secs, y=y_vals, mode="markers",
+                                          name=label, legendgroup=label,
+                                          marker=dict(color=color, size=3)),
+                              row=1, col=1)
+            fig.add_trace(go.Histogram(x=vals, name=label, marker_color=color,
+                                        opacity=0.6, legendgroup=label,
+                                        showlegend=(not entries)),
+                          row=2, col=1)
+            n = len(vals)
+            step = max(1, n // _CDF_MAX)
+            fig.add_trace(go.Scatter(x=vals[::step],
+                                      y=[i / n for i in range(0, n, step)],
+                                      mode="lines", name=label, marker_color=color,
+                                      legendgroup=label, showlegend=False),
+                          row=3, col=1)
+
+    fig.update_layout(
+        barmode="overlay",
+        title=f"kube-burner-ocp — {title_suffix}",
+        height=900,
+    )
+    fig.write_html(out)
+    print(f"  [plotly] Report written to {out}")
+    fig.show()
+
+
+def _render_plots_plotly(series, agg, title_suffix):
+    """Dispatch to _plot_plotly; exists so call sites read as a single verb."""
+    _plot_plotly(series, agg=agg, title_suffix=title_suffix)
+
+
+def _render_plots_plotille_agg(series, title_suffix="", min_val=None, max_val=None,
+                                use_pretty_hist=False):
+    """Render aggregated plotille scatter + histogram + CDF from a multi-fragment series list."""
+    if not plotille or not series:
+        return
+    all_vals = sorted(v for s in series for v in s["sorted_vals"])
+    _buf = io.StringIO()
+    _buf.isatty = sys.stdout.isatty
+    with _spinner(desc="  Building graphs"):
+        with redirect_stdout(_buf):
+            n = len(series)
+            print(f"\n\033[1;34m{'='*25} VISUALS: AGGREGATED ({n} fragments) {'='*25}\033[0m")
+            _plot_multi_scatter(series, title_suffix=title_suffix, min_val=min_val or 0)
+            if use_pretty_hist:
+                _plot_frequency_histogram(all_vals)
+            else:
+                _plot_histogram_plotille(all_vals, title_suffix)
+            _plot_cdf(all_vals, title_suffix)
+            print("\033[1;34m" + "="*70 + "\033[0m\n")
+    print(_buf.getvalue(), end="")
+
+
+def _render_plots_plotille_single(entries, plot_vals, title_suffix="", scatter_t0=None,
+                                   min_val=None, max_val=None, use_pretty_hist=False,
+                                   header=""):
+    """Render single-fragment plotille scatter + histogram + CDF."""
+    if not plotille:
+        return
+    _buf = io.StringIO()
+    _buf.isatty = sys.stdout.isatty
+    with _spinner(desc="  Building graphs"):
+        with redirect_stdout(_buf):
+            if header:
+                print(f"\n\033[1;34m{'='*25} VISUALS: {header} {'='*25}\033[0m")
+            _plot_metrics_scatter(entries, title_suffix=title_suffix,
+                                  t0=scatter_t0, min_val=min_val or 0)
+            if use_pretty_hist:
+                _plot_frequency_histogram(plot_vals)
+            else:
+                _plot_histogram_plotille(plot_vals, title_suffix)
+            _plot_cdf(plot_vals, title_suffix)
+            if header:
+                print("\033[1;34m" + "="*70 + "\033[0m\n")
+    print(_buf.getvalue(), end="")
+
+
+def _render_metrics_plotille_agg(series, display_base, min_val, max_val, show_scatter):
+    """Aggregate plotille histogram + CDF (and optional scatter) for metrics mode."""
+    if not plotille or not series:
+        return
+    all_vals = sorted(v for s in series
+                      for v in clip_to_range(s["sorted_vals"], min_val, max_val))
+    if not all_vals:
+        return
+    _buf = io.StringIO()
+    _buf.isatty = sys.stdout.isatty
+    with _spinner(desc="  Building graphs"):
+        with redirect_stdout(_buf):
+            if show_scatter:
+                scatter_series = [s for s in series if s.get("entries")]
+                if scatter_series:
+                    _plot_multi_scatter(scatter_series, title_suffix=display_base)
+            _plot_histogram_plotille(all_vals, f"AGGREGATED — {display_base}")
+            _plot_cdf(all_vals, f"AGGREGATED — {display_base}")
+    print(_buf.getvalue(), end="")
+
+
 def clip_to_range(values, min_val=None, max_val=None):
     """Filter values to [min_val, max_val]. None means no bound."""
-    logging.debug("clip_to_range")
     if min_val is None and max_val is None:
         return values
     return [v for v in values
@@ -898,7 +1096,8 @@ def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
 
 def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=None,
                        latency_key="podReadyLatency", field_filters=None,
-                       source=False, top_labels=10, tmin_sec=None, tmax_sec=None):
+                       source=False, top_labels=10, tmin_sec=None, tmax_sec=None,
+                       agg=False, plotly_mode=False):
     if not uuid_fragments:
         print(f"Usage: kb-parse [--no-visuals] <fragment1> <fragment2> ...")
         return
@@ -909,6 +1108,7 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
         return
 
     results = []
+    fragment_series = []  # collected for --agg / --plotly post-loop rendering
 
     for pair in discovered_pairs:
         data = {'uuid_fragment': pair['fragment']}
@@ -938,7 +1138,6 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                             m = extract_log_metrics(msg)
                             data.update({'sched_p99': m['p99'], 'sched_max': m['max'], 'sched_avg': m['avg']})
                         if "ContainersReady" in msg:
-                            logging.debug(f"Ready matched on: {msg}")
                             m = extract_log_metrics(msg)
                             data.update({'ready_p99': m['p99'], 'ready_max': m['max'], 'ready_avg': m['avg']})
         except Exception as e:
@@ -984,6 +1183,8 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
             )
             if entries:
                 # Values are sorted by value from cache; extract for stats and plotting.
+                entries = clip_entries_to_range(entries,min_val=min_val,max_val=max_val)
+                entries = clip_entries_to_time_range(entries,tmin_sec=tmin_sec,tmax_sec=tmax_sec)
                 sorted_vals = [e["value"] for e in entries]
                 n_vals = len(sorted_vals)
 
@@ -997,25 +1198,28 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     if base_cached and "timestamps" in base_cached:
                         scatter_t0 = min(base_cached["timestamps"])
 
-                if not no_visuals and plotille:
+                plot_vals = sorted_vals  # already clipped via _load_lat_metrics_normalized
+
+                # Collect for post-loop aggregate / plotly rendering (always).
+                fragment_series.append({
+                    "entries":     entries,
+                    "sorted_vals": plot_vals,
+                    "label":       pair["fragment"][:8],
+                    "color":       _SERIES_COLORS[len(fragment_series) % len(_SERIES_COLORS)],
+                })
+
+                # Per-fragment plotille plots — skipped when --agg or --plotly is active.
+                if not no_visuals and plotille and not agg and not plotly_mode:
                     _t0 = time.perf_counter()
-                    plot_vals = sorted_vals  # already clipped via _load_lat_metrics_normalized
-                    _buf = io.StringIO()
-                    _buf.isatty = sys.stdout.isatty
-                    with _spinner(desc="  Building graphs"):
-                        with redirect_stdout(_buf):
-                            print(f"\n\033[1;34m" + "="*25
-                                  + f" VISUALS: {data['scheduler']} {pair['fragment']} "
-                                  + "="*25 + "\033[0m")
-                            _plot_metrics_scatter(entries, title_suffix=latency_key,
-                                                  t0=scatter_t0, min_val=min_val or 0)
-                            if min_val is not None or max_val is not None:
-                                _plot_histogram_plotille(plot_vals, f'{latency_key} Zoomed')
-                            else:
-                                _plot_frequency_histogram(plot_vals)
-                            _plot_cdf(plot_vals)
-                            print("\033[1;34m" + "="*70 + "\033[0m\n")
-                    print(_buf.getvalue(), end="")
+                    use_pretty = (min_val is None and max_val is None)
+                    _render_plots_plotille_single(
+                        entries, plot_vals,
+                        title_suffix=latency_key,
+                        scatter_t0=scatter_t0,
+                        min_val=min_val, max_val=max_val,
+                        use_pretty_hist=use_pretty,
+                        header=f"{data['scheduler']} {pair['fragment']}",
+                    )
                     _elapsed = time.perf_counter() - _t0
                     if _elapsed > 0.5:
                         _info(f"  (built graphs in {_elapsed:.1f}s)")
@@ -1062,6 +1266,12 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     max_val=data.get('max', '-'), unit="ms",
                 )
 
+            # Not the cleanest, but cached stats are separated by latency type, so we
+            # simply append the column for CSV prior to printing time
+            if latency_key == LatencyType.schedulingLatency.value:
+                logging.debug(f"{data}")
+                data['sched_stddev'] = data['stddev'] if data['stddev'] is not None else DEFAULT_VAL
+
             if source:
                 range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
                 cache_path_s = _metrics_cache_path(lat_path, latency_key=latency_key)
@@ -1078,12 +1288,21 @@ def process_automation(uuid_fragments, no_visuals=False, min_val=None, max_val=N
                     _merge_cardinality_to_cache(cache_path_s, source_mtime_s, range_key, card)
         except Exception as e: logging.error(f"  [!] Metrics JSON Error: {e}")
 
-        # Not the cleanest, but cached stats are separated by latency type, so we
-        # simply append the column for CSV prior to printing time
-        if latency_key == LatencyType.schedulingLatency.value:
-            data['sched_stddev'] = data['stddev']
 
         results.append({col: data.get(col, DEFAULT_VAL) for col in COLUMN_ORDER})
+
+    # Post-loop: aggregate or plotly rendering (--agg / --plotly)
+    if not no_visuals and fragment_series:
+        use_pretty = (min_val is None and max_val is None)
+        if plotly_mode:
+            _render_plots_plotly(fragment_series, agg=agg, title_suffix=latency_key)
+        elif agg:
+            _render_plots_plotille_agg(
+                fragment_series, title_suffix=latency_key,
+                min_val=min_val, max_val=max_val,
+                use_pretty_hist=use_pretty,
+            )
+        # else: already rendered per-fragment inside the loop above
 
     # Summary Table — always printed
     print("\n" + " " * 20 + "\033[1;32m📊 FINAL COMPARISON SUMMARY\033[0m")
@@ -1131,11 +1350,15 @@ def _compute_stats(sorted_vals):
 def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
                                   no_visuals=False, min_val=None, max_val=None,
                                   scatter=False, source=False, tmin_sec=None, tmax_sec=None,
-                                  top_labels=10):
+                                  top_labels=10, _collect=False):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
     (e.g. {"id": "/kubepods.slice", "node": "e26-h21-000-r650"}).
+
+    When _collect=True: suppresses all visual output and returns
+    (sorted_vals, entries, scatter_t0) for the caller to aggregate across fragments.
+    Stats tables and cardinality are still printed. Caches are read/written normally.
     """
     if not os.path.isfile(filepath):
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
@@ -1289,6 +1512,11 @@ def run_generic_metrics_analysis(filepath, metric_name=None, label_filters=None,
             card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=top_labels)
             _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
 
+    if _collect:
+        # Caller handles rendering; return data for aggregation.
+        logging.info("  (analysis complete — data returned for aggregation)")
+        return sorted_vals, entries, scatter_t0
+
     if not no_visuals and plotille:
         # Fast path: sorted_vals is already the filtered subset — no clip needed.
         # Slow path: clip the full sorted_vals to the display range.
@@ -1329,6 +1557,7 @@ def _classify_cv(cv):
 
 def _parse_bucket_arg(raw_str, flag_name):
     """Parse 'MIN, MAX', ',MAX', or 'MIN' into (lo, hi). Exits on error."""
+    logging.debug(f"_parse_bucket_arg {flag_name}={raw_str}")
     raw = raw_str.strip().strip('[]()')
     try:
         if ',' in raw:
@@ -1382,6 +1611,12 @@ if __name__ == "__main__":
                             "Choices: " + ", ".join(t.value for t in LatencyType) + ". "
                             "Default: podReadyLatency."
                         ))
+    parser.add_argument("--agg", action="store_true",
+                        help="Combine all fragments' data into one aggregated scatter/histogram/CDF "
+                             "instead of separate plots per fragment.")
+    parser.add_argument("--plotly", action="store_true",
+                        help="Use plotly interactive HTML output (opens in browser) instead of "
+                             "plotille terminal plots. Compatible with --agg.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show all timing detail including intermediate steps.")
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -1451,16 +1686,19 @@ if __name__ == "__main__":
                            field_filters=label_filters or None,
                            source=args.source,
                            top_labels=args.top_labels,
-                           tmin_sec=args.tmin, tmax_sec=args.tmax)
+                           tmin_sec=args.tmin, tmax_sec=args.tmax,
+                           agg=args.agg, plotly_mode=args.plotly)
 
     if run_metrics and metric_files:
         if not discovered_pairs:
             print(f"[!] No collected-metrics dirs found — cannot locate metric files.", file=sys.stderr)
             sys.exit(1)
+        use_agg_path = args.agg or args.plotly
         for raw_file in metric_files:
             metric_file = raw_file if raw_file.endswith(".json") else raw_file + ".json"
             # TODO remove metric_name
             display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
+            agg_series = []
             for pair in discovered_pairs:
                 if not pair.get("metrics_dir"):
                     continue
@@ -1469,19 +1707,51 @@ if __name__ == "__main__":
                     print(f"[!] Not found: {filepath}", file=sys.stderr)
                     continue
                 metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
-                run_generic_metrics_analysis(
-                    filepath,
-                    metric_name=metric_name,
-                    label_filters=label_filters or None,
-                    no_visuals=args.no_visuals,
-                    min_val=args.min,
-                    max_val=args.max,
-                    scatter=args.scatter,
-                    source=args.source,
-                    tmin_sec=args.tmin,
-                    tmax_sec=args.tmax,
-                    top_labels=args.top_labels,
-                )
+                if use_agg_path:
+                    result = run_generic_metrics_analysis(
+                        filepath,
+                        metric_name=metric_name,
+                        label_filters=label_filters or None,
+                        no_visuals=True,
+                        min_val=args.min,
+                        max_val=args.max,
+                        scatter=args.scatter,
+                        source=args.source,
+                        tmin_sec=args.tmin,
+                        tmax_sec=args.tmax,
+                        top_labels=args.top_labels,
+                        _collect=True,
+                    )
+                    if result:
+                        sorted_vals, entries, scatter_t0 = result
+                        agg_series.append({
+                            "sorted_vals": sorted_vals,
+                            "entries":     entries,
+                            "label":       pair["fragment"][:8],
+                            "color":       _SERIES_COLORS[len(agg_series) % len(_SERIES_COLORS)],
+                        })
+                else:
+                    run_generic_metrics_analysis(
+                        filepath,
+                        metric_name=metric_name,
+                        label_filters=label_filters or None,
+                        no_visuals=args.no_visuals,
+                        min_val=args.min,
+                        max_val=args.max,
+                        scatter=args.scatter,
+                        source=args.source,
+                        tmin_sec=args.tmin,
+                        tmax_sec=args.tmax,
+                        top_labels=args.top_labels,
+                    )
+
+            if use_agg_path and not args.no_visuals and agg_series:
+                if args.plotly:
+                    _render_plots_plotly(agg_series, agg=args.agg, title_suffix=display_base)
+                else:
+                    _render_metrics_plotille_agg(
+                        agg_series, display_base, args.min, args.max, args.scatter
+                    )
     _t0 = time.perf_counter()
     _mem_cache.clear()
     _elapsed = time.perf_counter() - _t0
