@@ -372,11 +372,12 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         if not return_entries:
             logging.info(f"not return_entries. returning {len(values)} values")
             return values
+        t0_raw = cached.get("t0_raw")
         if not need_labels:
             logging.debug(f"does not need_labels")
             timestamps = cached.get("timestamps")
             logging.debug(f"timestamps: {len(timestamps)} , len(values): {len(values)}")
-            if timestamps is not None and len(timestamps) == len(values):
+            if timestamps is not None and len(timestamps) == len(values) and t0_raw is not None:
                 # One-time migration: convert legacy string timestamps to epoch floats.
                 # TODO delete ? We can just delete the cache files.
                 if timestamps and isinstance(timestamps[0], str):
@@ -388,7 +389,8 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                     _save_cache(cache_path, {**cached, "timestamps": timestamps})
                     logging.debug(f"cache saved")
                 _t0 = time.perf_counter()
-                tuple = [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
+                tuple = [{"timestamp": ts, "elapsedTime": ts - t0_raw, "value": v}
+                         for ts, v in zip(timestamps, values)]
                 _elapsed = time.perf_counter() - _t0
                 logging.debug(f"tuple zipped from cache in {_elapsed:.1f}s")
                 return tuple
@@ -400,15 +402,15 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
             # but those are handled by the warm path below (line ~372).
             labels = cached.get("labels")
             timestamps = cached.get("timestamps")
-            if (labels is not None and timestamps is not None
+            if (labels is not None and timestamps is not None and t0_raw is not None
                     and len(labels) == len(values) and len(timestamps) == len(values)):
                 _t0 = time.perf_counter()
-                triples = [{"timestamp": ts, "value": v, "labels": lab}
-                        for ts, v, lab in zip(timestamps, values, labels)]
+                triples = [{"timestamp": ts, "elapsedTime": ts - t0_raw, "value": v, "labels": lab}
+                           for ts, v, lab in zip(timestamps, values, labels)]
                 _elapsed = time.perf_counter() - _t0
                 logging.debug(f"values zipped from cache in {_elapsed:.1f}s")
                 return triples
-        # Old cache without timestamps/labels — fall through to full parse
+        # Old cache without timestamps/labels/t0_raw — fall through to full parse
 
     logging.debug("cached is None or needs_labels. Falling back to full kbcache")
     # Warm path for label-filtered calls: if the base (unfiltered) kbcache has labels,
@@ -417,8 +419,9 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         logging.debug("has label_filters")
         base_path   = _metrics_cache_path(filepath)
         base_cached = _load_cache(base_path, source_mtime)
-        if base_cached is not None and "labels" in base_cached:
+        if base_cached is not None and "labels" in base_cached and "t0_raw" in base_cached:
             _elapsed      = time.perf_counter() - _t0
+            bc_t0_raw     = base_cached["t0_raw"]
             bc_values     = base_cached["values"]
             bc_timestamps = base_cached["timestamps"]
             bc_labels     = base_cached["labels"]
@@ -435,6 +438,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                     key_counters[k][v] += 1
             logging.debug("keys counted")
             _save_cache(cache_path, {
+                "t0_raw": bc_t0_raw,
                 "values": values,
                 "timestamps": timestamps,
                 "cardinality": {"None-None-None-None":
@@ -445,13 +449,14 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 return values
             if need_labels:
                 _t0 = time.perf_counter()
-                zipped = [{"labels": lab, "value": v, "timestamp": ts}
-                        for lab, v, ts in zip(labs, values, timestamps)]
+                zipped = [{"labels": lab, "elapsedTime": ts - bc_t0_raw, "value": v, "timestamp": ts}
+                          for lab, v, ts in zip(labs, values, timestamps)]
                 _elapsed = time.perf_counter() - _t0
                 logging.debug(f"label-value-time tuple zipped from cache in {_elapsed:.1f}s")
                 return zipped
             _t0 = time.perf_counter()
-            zipped = [{"value": v, "timestamp": ts} for v, ts in zip(values, timestamps)]
+            zipped = [{"elapsedTime": ts - bc_t0_raw, "value": v, "timestamp": ts}
+                      for v, ts in zip(values, timestamps)]
             _elapsed = time.perf_counter() - _t0
             logging.debug(f"value-time tuple zipped from cache in {_elapsed:.1f}s")
             return zipped
@@ -498,18 +503,24 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     values      = [p[0] for p in paired]
     timestamps  = [p[1] for p in paired]
     labels_list = [p[2] for p in paired]
+    t0_raw = min(timestamps) if timestamps else 0.0
     cardinality_cache = {"None-None-None-None": {k: dict(v) for k, v in key_counters.items()}}
     if not label_filters:
         # Base cache: include labels to enable in-memory filtering for future --label calls.
-        _save_cache(cache_path, {"values": values, "timestamps": timestamps,
+        _save_cache(cache_path, {"t0_raw": t0_raw, "values": values, "timestamps": timestamps,
                                  "labels": labels_list, "cardinality": cardinality_cache})
     else:
-        _save_cache(cache_path, {"values": values, "timestamps": timestamps,
+        _save_cache(cache_path, {"t0_raw": t0_raw, "values": values, "timestamps": timestamps,
                                  "cardinality": cardinality_cache})
-    if return_entries and not need_labels:
+    if return_entries and need_labels:
+        # elapsedTime was not known during the loop; stamp it now.
+        for e in entries:
+            e["elapsedTime"] = e["timestamp"] - t0_raw
+    elif return_entries:
         # Reconstruct minimal entries from already-collected parallel arrays —
         # avoids building 5M full entry dicts during the parse loop.
-        entries = [{"timestamp": ts, "value": v} for ts, v in zip(timestamps, values)]
+        entries = [{"timestamp": ts, "elapsedTime": ts - t0_raw, "value": v}
+                   for ts, v in zip(timestamps, values)]
     return entries if return_entries else values
 
 
@@ -519,14 +530,16 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
                                    tmin_sec=None, tmax_sec=None):
     """Load podLatencyMeasurement JSON in unified metrics format.
 
-    Each source entry becomes {"timestamp": epoch_float, "value": float, "labels": dict}
-    where labels contains the non-latency metadata fields (jobIteration, replica, etc.).
-    The latency type is implicit in which cache file is loaded (one per latency_key).
+    Each source entry becomes
+        {"timestamp": epoch_float, "elapsedTime": float, "value": float, "labels": dict}
+    where elapsedTime is seconds from the fragment's global minimum timestamp (t0_raw),
+    computed once at first parse and persisted in cache. All time-range filtering uses
+    elapsedTime directly — no re-anchoring, no shift on subsequent filter passes.
 
     Base cache (all unfiltered entries for this latency_key):
-        {"values": [float,...], "timestamps": [float,...], "labels": [dict,...],
-         "cardinality": {"None-None-None-None": {field: {val: count}}}}
-    Old-format caches (with "fields" key but no "values") are treated as misses.
+        {"t0_raw": float, "values": [float,...], "timestamps": [float,...],
+         "labels": [dict,...], "cardinality": {"None-None-None-None": {field: {val: count}}}}
+    Old-format caches (without "t0_raw") are treated as misses and rebuilt.
 
     Subset cache for filtered combinations (field_filters + bin + time):
         via _metrics_cache_path() — same pattern as generic metrics.
@@ -547,15 +560,18 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
     # --- Subset cache fast path ---
     if subset_path and not (tmin_sec is not None or tmax_sec is not None):
         _subset = _load_cache(subset_path, source_mtime)
-        if _subset and "values" in _subset and "timestamps" in _subset and "labels" in _subset:
+        if (_subset and "values" in _subset and "timestamps" in _subset
+                and "labels" in _subset and "t0_raw" in _subset):
             _info(f"  (latency subset cache loaded in {time.perf_counter()-_t0:.1f}s)")
-            return [{"timestamp": ts, "value": v, "labels": lab}
+            _t0_raw = _subset["t0_raw"]
+            return [{"timestamp": ts, "elapsedTime": ts - _t0_raw, "value": v, "labels": lab}
                     for v, ts, lab in zip(_subset["values"], _subset["timestamps"], _subset["labels"])]
 
     # --- Base cache warm path ---
     base_cached = _load_cache(cache_path, source_mtime)
-    if base_cached is not None and "values" in base_cached:
+    if base_cached is not None and "values" in base_cached and "t0_raw" in base_cached:
         _info(f"  (latency cache loaded in {time.perf_counter()-_t0:.1f}s)")
+        t0_raw     = base_cached["t0_raw"]
         values     = base_cached["values"]
         timestamps = base_cached["timestamps"]
         labels     = base_cached["labels"]
@@ -567,7 +583,7 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
             values     = [t[0] for t in triples]
             timestamps = [t[1] for t in triples]
             labels     = [t[2] for t in triples]
-        entries = [{"timestamp": ts, "value": v, "labels": lab}
+        entries = [{"timestamp": ts, "elapsedTime": ts - t0_raw, "value": v, "labels": lab}
                    for v, ts, lab in zip(values, timestamps, labels)]
     else:
         # --- Cold parse ---
@@ -598,10 +614,12 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
         sv = [p[0] for p in triplets]
         sts = [p[1] for p in triplets]
         sl = [p[2] for p in triplets]
+        t0_raw = min(sts) if sts else 0.0
         _save_cache(cache_path, {
-            "values":     sv,
-            "timestamps": sts,
-            "labels":     sl,
+            "t0_raw":      t0_raw,
+            "values":      sv,
+            "timestamps":  sts,
+            "labels":      sl,
             "cardinality": {"None-None-None-None": {k: dict(v) for k, v in card.items()}},
         })
         _info(f"  (latency cache built in {time.perf_counter()-_t0:.1f}s)")
@@ -612,30 +630,18 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
             sv  = [t[0] for t in triples]
             sts = [t[1] for t in triples]
             sl  = [t[2] for t in triples]
-        entries = [{"timestamp": ts, "value": v, "labels": lab}
+        entries = [{"timestamp": ts, "elapsedTime": ts - t0_raw, "value": v, "labels": lab}
                    for v, ts, lab in zip(sv, sts, sl)]
 
-    # Apply value range clip.
-    if min_val is not None or max_val is not None:
-        entries = clip_entries_to_range(entries, min_val, max_val)
-
-    # Apply time range filter (same logic as run_generic_metrics_analysis).
-    if entries and (tmin_sec is not None or tmax_sec is not None):
-        ts_list = [e["timestamp"] for e in entries]
-        t0_epoch = min(ts_list)
-        entries = [
-            e for e, ts in zip(entries, ts_list)
-            if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
-            and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
-        ]
-        if not entries:
-            print(f"  [!] No latency entries in time window [{tmin_sec}s, {tmax_sec}s]",
-                  file=sys.stderr)
+    # Apply value range clip then time range filter via shared helpers.
+    entries = clip_entries_to_range(entries, min_val, max_val)
+    entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
 
     # Write subset cache (values + timestamps + labels) for filtered combos without time range,
     # so a subsequent warm run can skip the base cache entirely.
     if subset_path and entries and not (tmin_sec is not None or tmax_sec is not None):
         _save_cache(subset_path, {
+            "t0_raw":     t0_raw,
             "values":     [e["value"]     for e in entries],
             "timestamps": [e["timestamp"] for e in entries],
             "labels":     [e["labels"]    for e in entries],
@@ -762,38 +768,21 @@ _PLOTLY_COLORS = ["#00bcd4", "#4caf50", "#e91e63", "#ff9800", "#f44336", "#2196f
 _PLOTLY_OUTPUT = "kube-burner-ocp-report.html"
 
 
-def _plot_metrics_scatter(entries, title_suffix="", t0=None, min_val=0):
-    """Plot value over elapsed time for generic metric entries (timestamp + value).
+def _plot_metrics_scatter(entries, title_suffix="", min_val=0):
+    """Plot value over elapsed time for generic metric entries.
 
-    t0: optional epoch-float anchor for the X-axis origin. When provided (e.g.
-    from the full unclipped dataset), elapsed seconds are computed relative to it
-    so the X-axis position is preserved after time-range filtering.
-
-    Timestamps in entries are used as epoch floats when available (cache path),
-    falling back to _parse_timestamp() for legacy string-timestamp entries.
+    Each entry must carry an 'elapsedTime' field (seconds from the fragment's
+    global t0_raw, computed at parse time and persisted in cache).
     """
     n_orig = len(entries)
     if n_orig > _SCATTER_MAX:
         entries = random.sample(entries, _SCATTER_MAX)
-    data_points = []
-    for entry in entries:
-        ts_raw = entry.get("timestamp")
-        val = entry.get("value")
-        if ts_raw is None or val is None:
-            continue
-        if isinstance(ts_raw, (int, float)):
-            ts_epoch = float(ts_raw)
-        else:
-            dt = _parse_timestamp(ts_raw)
-            if dt is None:
-                continue
-            ts_epoch = dt.timestamp()
-        data_points.append((ts_epoch, float(val)))
+    data_points = [(e["elapsedTime"], float(e["value"]))
+                   for e in entries if "elapsedTime" in e and "value" in e]
     if not data_points:
         return
     data_points.sort(key=lambda x: x[0])
-    t0_epoch = t0 if t0 is not None else data_points[0][0]
-    x_secs = [p[0] - t0_epoch for p in data_points]
+    x_secs = [p[0] for p in data_points]
     y_vals = [p[1] for p in data_points]
     title = f"[ Metrics Scatter (Time vs. Value){(' ' + title_suffix) if title_suffix else ''} ]"
     print(f"\n{title}")
@@ -887,8 +876,8 @@ def _plot_multi_scatter(series, title_suffix="", min_val=0):
     """Overlay multiple fragment scatter series on one plotille terminal figure.
 
     series: list of {"entries": [...], "label": str, "color": str}
-    Each series normalizes time to elapsed seconds from its own earliest timestamp
-    so all runs overlap on a common 0-relative axis for easy comparison.
+    Each entry carries 'elapsedTime' (seconds from the fragment's global t0_raw),
+    so all runs share a common 0-relative axis for easy comparison.
     """
     if not plotille or not series:
         return
@@ -902,8 +891,7 @@ def _plot_multi_scatter(series, title_suffix="", min_val=0):
             continue
         if len(entries) > _SCATTER_MAX:
             entries = random.sample(entries, _SCATTER_MAX)
-        t0 = min(e["timestamp"] for e in entries)
-        x_secs = [e["timestamp"] - t0 for e in entries]
+        x_secs = [e["elapsedTime"] for e in entries]
         y_vals = [e["value"] for e in entries]
         all_x.extend(x_secs)
         fig.scatter(x_secs, y_vals, lc=s["color"], label=s["label"])
@@ -941,8 +929,7 @@ def _plot_plotly(series, agg=False, title_suffix="", output_html=None):
         all_vals = sorted(v for s in series for v in s["sorted_vals"])
         all_entries = [e for s in series for e in (s.get("entries") or [])]
         if all_entries:
-            t0 = min(e["timestamp"] for e in all_entries)
-            x_secs = [e["timestamp"] - t0 for e in all_entries]
+            x_secs = [e["elapsedTime"] for e in all_entries]
             y_vals = [e["value"] for e in all_entries]
             fig.add_trace(go.Scatter(x=x_secs, y=y_vals, mode="markers",
                                      name="All Fragments",
@@ -964,8 +951,7 @@ def _plot_plotly(series, agg=False, title_suffix="", output_html=None):
             entries = s.get("entries") or []
             vals = s["sorted_vals"]
             if entries:
-                t0 = min(e["timestamp"] for e in entries)
-                x_secs = [e["timestamp"] - t0 for e in entries]
+                x_secs = [e["elapsedTime"] for e in entries]
                 y_vals = [e["value"] for e in entries]
                 # TODO marginal_x/y are neat, but plotly express and cannot be used in subplots.
                 # fig = px.scatter(x=x_secs, y=y_vals, marginal_x="histogram", marginal_y="rug", labels=label)
@@ -1022,7 +1008,7 @@ def _render_plots_plotille_agg(series, cfg, title_suffix="", min_val=None, max_v
     print(_buf.getvalue(), end="")
 
 
-def _render_plots_plotille_single(entries, plot_vals, cfg, title_suffix="", scatter_t0=None,
+def _render_plots_plotille_single(entries, plot_vals, cfg, title_suffix="",
                                    min_val=None, max_val=None, header=""):
     """Render single-fragment plotille scatter + histogram + CDF."""
     if not plotille:
@@ -1034,8 +1020,7 @@ def _render_plots_plotille_single(entries, plot_vals, cfg, title_suffix="", scat
         with redirect_stdout(_buf):
             if header:
                 print(f"\n\033[1;34m{'='*25} VISUALS: {header} {'='*25}\033[0m")
-            _plot_metrics_scatter(entries, title_suffix=title_suffix,
-                                  t0=scatter_t0, min_val=min_val or 0)
+            _plot_metrics_scatter(entries, title_suffix=title_suffix, min_val=min_val or 0)
             if use_pretty_hist:
                 _plot_frequency_histogram(plot_vals, cfg)
             else:
@@ -1086,27 +1071,21 @@ def clip_entries_to_range(entries, min_val=None, max_val=None):
 
 
 def clip_entries_to_time_range(entries, tmin_sec=None, tmax_sec=None):
-    """Filter entry dicts to those whose timestamp falls within [tmin_sec, tmax_sec]
-    elapsed seconds from the first timestamp in the dataset. None means no bound."""
+    """Filter entry dicts to those whose elapsedTime falls within [tmin_sec, tmax_sec].
+    elapsedTime is pre-computed relative to the fragment's global t0_raw at parse time."""
     logging.debug("clip_entries_to_time_range")
     if tmin_sec is None and tmax_sec is None:
         return entries
-    timestamps = []
-    for e in entries:
-        ts = _parse_timestamp(e.get("timestamp"))
-        if ts is None:
-            continue
-        timestamps.append((ts, e))
-    if not timestamps:
-        return entries
-    timestamps.sort(key=lambda x: x[0])
-    start_t = timestamps[0][0]
-    result = []
-    for ts, e in timestamps:
-        elapsed = (ts - start_t).total_seconds()
-        if clip_to_range([elapsed], tmin_sec, tmax_sec):
-            result.append(e)
-    return result
+    filtered = [
+        e for e in entries
+        if (tmin_sec is None or e["elapsedTime"] >= tmin_sec)
+        and (tmax_sec is None or e["elapsedTime"] <= tmax_sec)
+    ]
+    if not filtered:
+        lo = f"{tmin_sec}s" if tmin_sec is not None else "start"
+        hi = f"{tmax_sec}s" if tmax_sec is not None else "end"
+        logging.warning(f"No entries in time window [{lo}, {hi}]")
+    return filtered
 
 
 
@@ -1198,23 +1177,11 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                 tmin_sec=tmin_sec, tmax_sec=tmax_sec,
             )
             if entries:
-                # Values are sorted by value from cache; extract for stats and plotting.
-                entries = clip_entries_to_range(entries,min_val=min_val,max_val=max_val)
-                entries = clip_entries_to_time_range(entries,tmin_sec=tmin_sec,tmax_sec=tmax_sec)
+                # Clipping is already applied inside _load_lat_metrics_normalized.
                 sorted_vals = [e["value"] for e in entries]
                 n_vals = len(sorted_vals)
 
-                # When time-clipping, anchor the scatter X-axis to the start of the
-                # full (unfiltered) dataset so the displayed window position is
-                # preserved — matching the behaviour of run_generic_metrics_analysis().
-                scatter_t0 = None
-                if tmin_sec is not None or tmax_sec is not None:
-                    base_cache_path = _metrics_cache_path(lat_path, latency_key=latency_key)
-                    base_cached = _load_cache(base_cache_path, os.path.getmtime(lat_path))
-                    if base_cached and "timestamps" in base_cached:
-                        scatter_t0 = min(base_cached["timestamps"])
-
-                plot_vals = sorted_vals  # already clipped via _load_lat_metrics_normalized
+                plot_vals = sorted_vals
 
                 # Collect for post-loop aggregate / plotly rendering (always).
                 fragment_series.append({
@@ -1230,7 +1197,6 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                     _render_plots_plotille_single(
                         entries, plot_vals, cfg,
                         title_suffix=latency_key,
-                        scatter_t0=scatter_t0,
                         min_val=min_val, max_val=max_val,
                         header=f"{data['scheduler']} {pair['fragment']}",
                     )
@@ -1368,7 +1334,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     (e.g. {"id": "/kubepods.slice", "node": "e26-h21-000-r650"}).
 
     When _collect=True: suppresses all visual output and returns
-    (sorted_vals, entries, scatter_t0) for the caller to aggregate across fragments.
+    (sorted_vals, entries) for the caller to aggregate across fragments.
     Stats tables and cardinality are still printed. Caches are read/written normally.
     """
     if not os.path.isfile(filepath):
@@ -1394,45 +1360,16 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     logging.debug(f"need_entries={need_entries}")
 
     entries = None
-    scatter_t0 = None  # X-axis anchor; set from full dataset when time-clipping
     if need_entries:
         logging.info("not _subset_fast_path and does need_entries")
         entries = load_generic_metrics(filepath, label_filters=label_filters,
                                         return_entries=True, need_labels=need_labels)
         if tmin_sec is not None or tmax_sec is not None:
-            # Single pass: parse timestamps once, sort once, derive scatter_t0
-            # and filter in the same loop — avoids the previous double-parse +
-            # redundant sort inside clip_entries_to_time_range.
             original_n = len(entries)
-            _t0 = time.perf_counter()
-            # Extract timestamps as a flat float list — no tuple allocation, no sort.
-            # Use min() to find t0_epoch (O(n), implemented in C), then zip-filter.
-            # Fall back to _parse_timestamp only for legacy string-timestamp caches.
-            first_ts = entries[0].get("timestamp") if entries else None
-            if isinstance(first_ts, (int, float)):
-                ts_list = [e["timestamp"] for e in entries]
-            else:
-                ts_list = [
-                    (dt.timestamp() if (dt := _parse_timestamp(e.get("timestamp"))) is not None else 0.0)
-                    for e in entries
-                ]
-            _debug(f"  (extracted {len(ts_list):,} epoch timestamps in {time.perf_counter()-_t0:.2f}s)")
-            _t0 = time.perf_counter()
-            if ts_list:
-                t0_epoch = min(ts_list)
-                scatter_t0 = t0_epoch
-                entries = [
-                    e for e, ts in zip(entries, ts_list)
-                    if (tmin_sec is None or ts - t0_epoch >= tmin_sec)
-                    and (tmax_sec is None or ts - t0_epoch <= tmax_sec)
-                ]
-            else:
-                entries = []
-            _debug(f"  (min+filter in {time.perf_counter()-_t0:.2f}s)")
+            entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
             if not entries:
-                print(f"  [!] No entries in time window [{tmin_sec}s, {tmax_sec}s]", file=sys.stderr)
                 return
-            _info(f"  (time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries)")
+            logging.info(f"time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries")
         _t0 = time.perf_counter()
         values = [e["value"] for e in entries]
         logging.debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
@@ -1526,7 +1463,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     if _collect:
         # Caller handles rendering; return data for aggregation.
         logging.info("  (analysis complete — data returned for aggregation)")
-        return sorted_vals, entries, scatter_t0
+        return sorted_vals, entries
 
     if not cfg.no_visuals and plotille:
         # Fast path: sorted_vals is already the filtered subset — no clip needed.
@@ -1543,7 +1480,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
             with _spinner(desc="  Building graphs"):
                 with redirect_stdout(_buf):
                     if cfg.scatter and entries is not None:
-                        _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, t0=scatter_t0, min_val=min_val)
+                        _plot_metrics_scatter(clip_entries_to_range(entries, min_val, max_val), title_suffix=title_suffix, min_val=min_val)
                     _plot_histogram_plotille(plot_vals, cfg, title_suffix=title_suffix)
                     _plot_cdf(plot_vals, cfg, title_suffix=title_suffix)
             print(_buf.getvalue(), end="")
@@ -1745,7 +1682,7 @@ if __name__ == "__main__":
                         _collect=True,
                     )
                     if result:
-                        sorted_vals, entries, scatter_t0 = result
+                        sorted_vals, entries = result
                         agg_series.append({
                             "sorted_vals": sorted_vals,
                             "entries":     entries,
