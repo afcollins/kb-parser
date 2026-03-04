@@ -31,6 +31,7 @@ class RenderConfig:
     plotly:     bool = False
     no_hist:    bool = False
     no_cdf:     bool = False
+    group_by:   str  = None
 # plotly.express for scatter with marginal distributions
 # import plotly.express as px
 # Attempt to import plotille for terminal visuals
@@ -1325,9 +1326,111 @@ def _compute_stats(sorted_vals):
             "min": sorted_vals[0], "max": sorted_vals[-1]}
 
 
+def _sample_label_keys(entries, sample=20):
+    """Return sorted list of unique label keys from the first N entries."""
+    keys = set()
+    for e in entries[:sample]:
+        keys.update((e.get("labels") or {}).keys())
+    return sorted(keys)
+
+
+def _compute_group_stats(entries, group_key, top_n=None):
+    """Partition entries by label key, compute stats per group.
+
+    Returns a list of (group_value, stats_dict) sorted by avg descending
+    (after top-N selection by count).  Returns [] if group_key is absent.
+    """
+    buckets = defaultdict(list)
+    found_key = False
+    for e in entries:
+        labels = e.get("labels") or {}
+        val = labels.get(group_key)
+        if val is not None:
+            found_key = True
+            buckets[str(val)].append(e["value"])
+        else:
+            buckets["<missing>"].append(e["value"])
+    if not found_key:
+        logging.warning(
+            f"--group-by: key {group_key!r} not found. "
+            f"Available keys: {_sample_label_keys(entries)}"
+        )
+        return []
+    results = [(gval, _compute_stats(sorted(vals))) for gval, vals in buckets.items()]
+    # Select top N by count first, then sort by avg descending.
+    results.sort(key=lambda x: -x[1]["n"])
+    if top_n is not None:
+        results = results[:top_n]
+    results.sort(key=lambda x: -x[1]["avg"])
+    return results
+
+
+def _print_group_stats_table(group_results, group_key, metric_name, total_count):
+    """Print a fixed-width ASCII table of per-group statistics."""
+    n_groups = len(group_results)
+    print(
+        f"\nGROUP BY [{group_key}] \u2014 {metric_name}"
+        f"  (total n={total_count:,}, showing {n_groups} group{'s' if n_groups != 1 else ''})"
+    )
+    hdr = (f"{'GROUP VALUE':<32} {'N':>8} {'AVG':>10} {'P50':>10}"
+           f" {'P90':>10} {'P99':>10} {'MIN':>10} {'MAX':>10} {'CV':>10}")
+    sep = "\u2500" * len(hdr)
+    print(hdr)
+    print(sep)
+    for gval, s in group_results:
+        label = (gval[:24] + "..") if len(gval) > 26 else gval
+        print(
+            f"{label:<32} {s['n']:>8,} {s['avg']:>10.4f} {s['p50']:>10.4f}"
+            f" {s['p90']:>10.4f} {s['p99']:>10.4f}"
+            f" {s['min']:>10.4f} {s['max']:>10.4f} {s['cv']:>10.3f}"
+        )
+    print(sep)
+
+
+GROUP_STATS_COLUMNS = [
+    "metric", "group_key", "group_value",
+    "n", "avg", "p50", "p90", "p99", "min", "max", "stdev", "cv",
+]
+
+
+def _write_group_stats_csv(group_results, group_key, metric_name, fragment_id):
+    """Write per-group stats to a dedicated CSV file.
+
+    Returns the output path, or None on error.
+    """
+    safe_metric  = re.sub(r"[^A-Za-z0-9_-]", "_", metric_name)
+    safe_key     = re.sub(r"[^A-Za-z0-9_-]", "_", group_key)
+    safe_frag    = re.sub(r"[^A-Za-z0-9_-]", "_", str(fragment_id))
+    out_path = f"kube-burner-group-{safe_metric}-{safe_key}-{safe_frag}.csv"
+    try:
+        with open(out_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=GROUP_STATS_COLUMNS)
+            writer.writeheader()
+            for gval, s in group_results:
+                writer.writerow({
+                    "metric":      metric_name,
+                    "group_key":   group_key,
+                    "group_value": gval,
+                    "n":           s["n"],
+                    "avg":         round(s["avg"],   6),
+                    "p50":         round(s["p50"],   6),
+                    "p90":         round(s["p90"],   6),
+                    "p99":         round(s["p99"],   6),
+                    "min":         round(s["min"],   6),
+                    "max":         round(s["max"],   6),
+                    "stdev":       round(s["stdev"], 6),
+                    "cv":          round(s["cv"],    6),
+                })
+        return out_path
+    except OSError as exc:
+        logging.error(f"_write_group_stats_csv: {exc}")
+        return None
+
+
 def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=None,
                                   min_val=None, max_val=None,
-                                  tmin_sec=None, tmax_sec=None, _collect=False):
+                                  tmin_sec=None, tmax_sec=None, _collect=False,
+                                  fragment_id=None):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -1355,7 +1458,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     if cfg.source:
         cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
 
-    need_labels = cfg.source and cached_card is None
+    need_labels = (cfg.source and cached_card is None) or bool(cfg.group_by)
     need_entries = cfg.scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
     logging.debug(f"need_entries={need_entries}")
 
@@ -1459,6 +1562,21 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
         elif entries is not None:
             card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=cfg.top_labels)
             _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
+
+    if cfg.group_by:
+        grp_entries = entries or []
+        if not grp_entries:
+            logging.warning("--group-by: no entry-level data available.")
+        else:
+            group_results = _compute_group_stats(grp_entries, cfg.group_by, top_n=cfg.top_labels)
+            if group_results:
+                _print_group_stats_table(group_results, cfg.group_by, display_name, len(grp_entries))
+                out = _write_group_stats_csv(
+                    group_results, cfg.group_by, display_name,
+                    fragment_id or os.path.basename(filepath)
+                )
+                if out:
+                    print(f"  [group CSV] {out}")
 
     if _collect:
         # Caller handles rendering; return data for aggregation.
@@ -1565,6 +1683,9 @@ if __name__ == "__main__":
     parser.add_argument("--plotly", action="store_true",
                         help="Use plotly interactive HTML output (opens in browser) instead of "
                              "plotille terminal plots. Compatible with --agg.")
+    parser.add_argument("--group-by", "-g", default=None, metavar="KEY",
+                        help="Split metric entries by label key and show per-group statistics. "
+                             "Use --top-labels N to control how many groups are shown (default 10).")
     parser.add_argument("--no-hist", action="store_true",
                         help="Suppress the frequency histogram plot.")
     parser.add_argument("--no-cdf", action="store_true",
@@ -1602,6 +1723,7 @@ if __name__ == "__main__":
         plotly=args.plotly,
         no_hist=args.no_hist,
         no_cdf=args.no_cdf,
+        group_by=getattr(args, "group_by", None),
     )
 
     positionals = args.positionals
@@ -1672,7 +1794,8 @@ if __name__ == "__main__":
                     result = run_generic_metrics_analysis(
                         filepath,
                         RenderConfig(no_visuals=True, scatter=cfg.scatter,
-                                     source=cfg.source, top_labels=cfg.top_labels),
+                                     source=cfg.source, top_labels=cfg.top_labels,
+                                     group_by=cfg.group_by),
                         metric_name=metric_name,
                         label_filters=label_filters or None,
                         min_val=args.min,
@@ -1680,6 +1803,7 @@ if __name__ == "__main__":
                         tmin_sec=args.tmin,
                         tmax_sec=args.tmax,
                         _collect=True,
+                        fragment_id=pair["fragment"],
                     )
                     if result:
                         sorted_vals, entries = result
@@ -1698,6 +1822,7 @@ if __name__ == "__main__":
                         max_val=args.max,
                         tmin_sec=args.tmin,
                         tmax_sec=args.tmax,
+                        fragment_id=pair["fragment"],
                     )
 
             if use_agg_path and not cfg.no_visuals and agg_series:
