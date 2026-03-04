@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Setup and Running
 
 ```bash
+source ~/.venv/kb-parser/bin/activate
 pip install plotille==5.0.0 tqdm ijson msgpack orjson
 chmod +x parser.py
 ```
@@ -18,7 +19,7 @@ chmod +x parser.py
 ```bash
 # Latency mode
 ./parser.py 2178a534 --no-visuals
-./parser.py 2178a534 -t 0,10 --no-visuals
+./parser.py 2178a534 -s -t 0,10
 ./parser.py 2178a534 -b ,3000 --no-visuals
 ./parser.py 2178a534 -S --no-visuals
 
