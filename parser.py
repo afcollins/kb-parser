@@ -3,7 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses
 import io
 import datetime
 import enum
@@ -1793,9 +1793,7 @@ if __name__ == "__main__":
                 if use_agg_path:
                     result = run_generic_metrics_analysis(
                         filepath,
-                        RenderConfig(no_visuals=True, scatter=cfg.scatter,
-                                     source=cfg.source, top_labels=cfg.top_labels,
-                                     group_by=cfg.group_by),
+                        dataclasses.replace(cfg, no_visuals=True),
                         metric_name=metric_name,
                         label_filters=label_filters or None,
                         min_val=args.min,
