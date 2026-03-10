@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace as dataclasses
 import io
 import datetime
 import enum
+import gzip
 import hashlib
 import json
 import math
@@ -244,6 +245,12 @@ def match_label_filters(entry, label_filters):
 # Key: cache_path → value: (source_mtime_threshold, data_dict)
 _mem_cache = {}
 
+def _open_file(path):
+    """Open a file for binary reading, transparently handling .gz compression."""
+    if path.endswith('.gz'):
+        return gzip.open(path, 'rb')
+    return open(path, 'rb')
+
 def _metrics_cache_path(filepath, label_filters=None, latency_key=None):
     """Return the cache file path for a given combination of filter dimensions.
 
@@ -255,7 +262,8 @@ def _metrics_cache_path(filepath, label_filters=None, latency_key=None):
     File naming:
       - Labels or latency_key: <base>_<hash8>.kbcache.*
     """
-    base = os.path.splitext(filepath)[0]
+    p = filepath[:-3] if filepath.endswith('.gz') else filepath
+    base = os.path.splitext(p)[0]
     ext = ".kbcache.msgpack" if _msgpack else ".kbcache.json"
 
     # Full hash: include every active dimension so each combination is unique.
@@ -472,7 +480,7 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     labels_list  = []
     key_counters = defaultdict(Counter)
     fname = os.path.basename(filepath)
-    with open(filepath, "rb") as f:
+    with _open_file(filepath) as f:
         _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
         if not _ijson and not isinstance(_iter, list):
             _iter = [_iter]
@@ -590,7 +598,7 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
         # --- Cold parse ---
         values_raw, timestamps_raw, labels_raw = [], [], []
         card = defaultdict(Counter)
-        with open(lat_path, 'rb') as f:
+        with _open_file(lat_path) as f:
             _iter = _ijson.items(f, 'item') if _ijson else _json_load(f)
             if not _ijson and not isinstance(_iter, list):
                 _iter = []
@@ -1169,6 +1177,8 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
         except Exception as e: print(f"  [!] Summary JSON Error: {e}")
 
         lat_path = os.path.join(pair['metrics_dir'], f"podLatencyMeasurement-{data['workload']}.json")
+        if not os.path.isfile(lat_path) and os.path.isfile(lat_path + ".gz"):
+            lat_path = lat_path + ".gz"
 
         try:
             entries = _load_lat_metrics_normalized(
@@ -1778,17 +1788,26 @@ if __name__ == "__main__":
             sys.exit(1)
         use_agg_path = args.agg or args.plotly
         for raw_file in metric_files:
-            metric_file = raw_file if raw_file.endswith(".json") else raw_file + ".json"
+            if raw_file.endswith(".json") or raw_file.endswith(".json.gz"):
+                metric_file = raw_file
+            else:
+                metric_file = raw_file + ".json"
             # TODO remove metric_name
-            display_base = getattr(args, "metric_name", None) or os.path.splitext(metric_file)[0]
+            display_base = getattr(args, "metric_name", None) or os.path.splitext(
+                metric_file[:-3] if metric_file.endswith('.gz') else metric_file)[0]
             agg_series = []
             for pair in discovered_pairs:
                 if not pair.get("metrics_dir"):
                     continue
                 filepath = os.path.join(pair["metrics_dir"], metric_file)
                 if not os.path.isfile(filepath):
-                    print(f"[!] Not found: {filepath}", file=sys.stderr)
-                    continue
+                    # Try .json.gz fallback if .json not found
+                    gz_path = filepath + ".gz" if not filepath.endswith(".gz") else None
+                    if gz_path and os.path.isfile(gz_path):
+                        filepath = gz_path
+                    else:
+                        print(f"[!] Not found: {filepath}", file=sys.stderr)
+                        continue
                 metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
                 if use_agg_path:
                     result = run_generic_metrics_analysis(
