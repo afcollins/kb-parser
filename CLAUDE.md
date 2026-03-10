@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Setup and Running
 
+Requires **Python 3.11+** (for full `fromisoformat` support; older versions emit a warning and use a compatibility shim).
+
 ```bash
 source ~/.venv/kb-parser/bin/activate
 pip install plotille==5.0.0 tqdm ijson msgpack orjson

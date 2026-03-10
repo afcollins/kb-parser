@@ -20,6 +20,9 @@ import threading
 import time
 import logging
 
+if sys.version_info < (3, 11):
+    logging.warning(f"Python 3.11+ recommended (running {sys.version}); timestamp parsing may be unreliable")
+
 
 @dataclass
 class RenderConfig:
@@ -214,12 +217,19 @@ def _resolve_latency_type(s):
 
 # --- 2. HELPER FUNCTIONS ---
 
+_TS_FRAC_RE = re.compile(r'(\.\d{1,6})')
+
 def _parse_timestamp(ts_raw):
     """Parse ISO timestamp string (or epoch float) to datetime. Returns None on failure."""
     if isinstance(ts_raw, (int, float)):
         return datetime.datetime.fromtimestamp(ts_raw, tz=datetime.timezone.utc)
     try:
-        return datetime.datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
+        s = str(ts_raw).replace('Z', '+00:00')
+        # Python < 3.11 fromisoformat requires exactly 3 or 6 fractional digits.
+        m = _TS_FRAC_RE.search(s)
+        if m and len(m.group(1)) - 1 not in (3, 6):
+            s = s[:m.start()] + m.group(1).ljust(7, '0') + s[m.end():]
+        return datetime.datetime.fromisoformat(s)
     except (ValueError, TypeError):
         return None
 
