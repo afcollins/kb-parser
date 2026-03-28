@@ -70,3 +70,11 @@ Fixed ordering defined in `COLUMN_ORDER`. New columns must be inserted at the co
 ### plotille and Optional Dependencies
 
 All optional deps (plotille, tqdm, ijson, msgpack, orjson) degrade gracefully when absent. Graph output is buffered via `redirect_stdout(io.StringIO())` while spinners are active; the buffer's `isatty` is patched so plotille emits ANSI colours correctly.
+
+## Standalone Analysis Scripts
+
+### analyze.py
+Reads the `max-*.json`, `cpu-*.json`, and `memory-*.json` summary metric files from a collected-metrics directory. Produces per-category breakdowns (CPU, Memory, Etcd, API latency), spike detection, etcd health assessment, cluster utilization summary, and optional cross-run comparison (`python3 analyze.py /path/to/other`).
+
+### container_stats.py
+Statistical analysis of per-container time-series JSON files (`containerCPU.json`, `containerMemory.json`). Auto-detects metric type; uses scientific notation for memory (bytes) and decimal for CPU (cores). Groups by label dimension (container, namespace, node, pod), clusters by magnitude x variability (CV), and detects anomalies (spike ratios, top consumers). Usage: `python3 container_stats.py <file.json> [file2.json ...]`.
