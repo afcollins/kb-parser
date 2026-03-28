@@ -50,19 +50,26 @@ Data directory:
 - cgroupCPU labels: id (5 cgroup slices), node (126)
 - nodeCPU labels: instance (120 workers / 3 masters), mode (7 CPU modes)
 
+### 6. Network, CRI-O, and Kubelet metrics (7 files)
+- **Script**: `container_stats.py`
+- All analyzed successfully; key findings:
+
+| File | Records | Labels | Key Finding |
+|------|---------|--------|-------------|
+| `nodeTxNetwork.json` | 2,520 | device (2), instance (126) | 3 outlier nodes with 10-100x higher TX (likely control plane); all others homogeneous, high CV (bursty) |
+| `nodeRxNetwork.json` | 2,520 | device (2), instance (126) | Same 3 outlier nodes + 2 more with elevated RX |
+| `nodeMajorFaults.json` | 1,260 | instance (126), pod (126) | All near-zero — no memory pressure |
+| `crioCPU.json` | 1,200 | node (120) | Mean 1.05–1.89 cores, homogeneous fleet |
+| `crioMemory.json` | 1,200 | node (120) | Mean 151–180 MB, very stable (CV <11%) |
+| `kubeletCPU.json` | 1,200 | node (120) | Mean 8.1–10.8 cores, 3 nodes >10 cores; kubelet ~7-8x heavier than CRI-O |
+| `kubeletMemory.json` | 1,200 | node (120) | Mean 265–400 MB, CV 6–26%, stable |
+
 ## TODO - Remaining Files
 
 ### Label-grouped time-series (`container_stats.py` should work as-is)
 
 | File | Records | Labels | Notes |
 |------|---------|--------|-------|
-| `nodeTxNetwork.json` | 2,520 | device, instance | Network TX bytes/sec per device per node |
-| `nodeRxNetwork.json` | ~2,520 | device, instance | Network RX bytes/sec per device per node |
-| `nodeMajorFaults.json` | 1,260 | instance + k8s labels | Page faults per node; mostly zeros likely |
-| `crioCPU.json` | ? | ? | CRI-O container runtime CPU |
-| `crioMemory.json` | ? | ? | CRI-O container runtime memory |
-| `kubeletCPU.json` | ? | ? | Kubelet CPU |
-| `kubeletMemory.json` | ? | ? | Kubelet memory |
 | `cgroupCPUSeconds-*.json` | ? | ? | Cumulative CPU seconds (Workers/Masters/Infra/namespaces, plus -start variants) |
 | `cgroupMemoryRSS-*.json` | ? | ? | RSS memory by role (Workers/Masters/Infra/namespaces, plus -start variants) |
 | `nodeCPUSeconds-*.json` | ? | ? | Cumulative CPU seconds per node |
@@ -130,7 +137,7 @@ Needs either adaptation of `pod_latency_stats.py` or a new script. The svcLatenc
 
 ## Suggested Next Steps
 
-1. Run `container_stats.py` on network/crio/kubelet files (should just work)
+1. ~~Run `container_stats.py` on network/crio/kubelet files~~ ✅ Done
 2. Analyze `mutatingAPICallsLatency.json` and `APIRequestRate.json` - group by resource/verb, flag SLO violations
 3. Inspect etcd files - reconcile raw vs non-raw vs DurationSeconds variants
 4. Adapt analysis for `svcLatencyMeasurement` format (ready field instead of value)
