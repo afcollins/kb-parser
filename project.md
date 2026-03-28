@@ -76,17 +76,22 @@ Data directory:
 | `nodeCPU-Infra.json` | ? | instance, mode | Infra node CPU |
 | `nodeMemoryUtilization-Infra.json` | ? | instance + k8s labels | Infra node memory |
 
-### API latency and request rate (may need custom analysis or adapt `container_stats.py`)
+### API latency and request rate — analyzed, see section 7 below.
 
-| File | Records | Labels | Notes |
-|------|---------|--------|-------|
-| `mutatingAPICallsLatency.json` | 1,135 | resource, scope, verb | P99 latency per API resource/verb combo |
-| `readOnlyAPICallsLatency.json` | ? | resource, scope, verb | Same for read-only calls |
-| `avg-mutating-apicalls-latency.json` | ? | resource | Average latencies |
-| `avg-ro-apicalls-latency.json` | ? | resource | Average read-only latencies |
-| `APIRequestRate.json` | 2,728 | code, resource, verb | Requests/sec by HTTP code, resource, verb |
+### 7. API Latency and Request Rate (5 files)
+- **Script**: `container_stats.py`
+- SLO thresholds: mutating P99 < 1s, read-only P99 < 500ms
 
-`container_stats.py` should work for initial grouping/clustering. A dedicated API latency script might be useful to cross-reference resource/verb combos, flag SLO violations (>1s mutating, >500ms read-only), and detect latency outliers.
+| File | Records | Labels | Key Finding |
+|------|---------|--------|-------------|
+| `mutatingAPICallsLatency.json` | 1,135 | resource (105), scope (2), verb (4) | **events P99 = 9.15s — SLO VIOLATION (9x over 1s)**; services max 1.76s; secrets/pods/configmaps borderline at P95 ~0.97s; ~98 other resources all 0.09–0.19s |
+| `readOnlyAPICallsLatency.json` | 1,443 | resource (151), scope (3), verb (2) | All within 500ms SLO; namespace LIST mean 133ms max 197ms; one `images` GET outlier spike to 848ms |
+| `avg-mutating-apicalls-latency.json` | 40 | resource (38), scope (2), verb (4) | Single-point averages; pods avg 595ms elevated; most resources 100–130ms |
+| `avg-ro-apicalls-latency.json` | 58 | resource (49), scope (2), verb (2) | All under 155ms, no concerns |
+| `APIRequestRate.json` | 2,728 | code (6), resource (157), verb (8) | subjectaccessreviews 30 req/s; pods/events/endpointslices extremely bursty (max 148–183 req/s); HTTP 403 bursts to 148 req/s |
+
+- **SLO violations**: Only `events` clearly violates (mutating P99 9.15s). `services` breaches at max only. Read-only all clear.
+- **Correlation**: High-latency resources (events, pods, endpointslices) are also the burstiest by request rate.
 
 ### Etcd metrics (mostly single-value or very few records)
 
@@ -138,7 +143,7 @@ Needs either adaptation of `pod_latency_stats.py` or a new script. The svcLatenc
 ## Suggested Next Steps
 
 1. ~~Run `container_stats.py` on network/crio/kubelet files~~ ✅ Done
-2. Analyze `mutatingAPICallsLatency.json` and `APIRequestRate.json` - group by resource/verb, flag SLO violations
+2. ~~Analyze API latency + request rate files~~ ✅ Done — events SLO violation found
 3. Inspect etcd files - reconcile raw vs non-raw vs DurationSeconds variants
 4. Adapt analysis for `svcLatencyMeasurement` format (ready field instead of value)
 5. Write combined cross-metric report tying CPU/memory/latency/etcd findings together

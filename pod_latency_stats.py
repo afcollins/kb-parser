@@ -109,6 +109,7 @@ def analyze_field(vals_sorted, field_name):
 
         # CDF transition detection
         percentiles = {p: compute_percentile(vals_sorted, p) for p in range(1, 100)}
+        result['_percentiles_1_99'] = percentiles
         deltas = {}
         for p in range(2, 99):
             deltas[p] = percentiles[p + 1] - percentiles[p - 1]
@@ -195,14 +196,30 @@ def print_report(metadata, field_results):
                           f"value={r[f'transition_{rank}_value_ms']:.0f}ms")
 
             print(f"\n    Recommended percentiles:")
-            plist = [('P20', 'band center'), ('P51', 'band center'),
-                     ('P68', 'transition'), ('P69', 'transition'),
-                     ('P75', 'band center'), ('P88', 'band center'),
-                     ('P98', 'band tail')]
-            for pname, role in plist:
-                v = r.get(pname, '')
-                if v != '':
-                    print(f"      {pname} = {v:.0f} ms  ({role})")
+            # Build from actual CDF transitions
+            transition_pcts = []
+            for rank in range(1, 6):
+                tp = r.get(f'transition_{rank}_percentile', '')
+                if tp != '':
+                    transition_pcts.append(int(tp))
+            plist = []
+            if transition_pcts:
+                first_trans = min(transition_pcts)
+                last_trans = max(transition_pcts)
+                b1_center = max(1, first_trans // 2)
+                plist.append((b1_center, 'band 1 center'))
+                for tp in sorted(transition_pcts):
+                    plist.append((tp, 'transition'))
+                b2_center = min(99, last_trans + (100 - last_trans) // 2)
+                plist.append((b2_center, 'band 2 center'))
+                b2_tail = min(99, b2_center + (100 - b2_center) // 2)
+                if b2_tail != b2_center:
+                    plist.append((b2_tail, 'band 2 tail'))
+            pct_map = r.get('_percentiles_1_99', {})
+            for p_num, role in plist:
+                v = pct_map.get(p_num)
+                if v is not None:
+                    print(f"      P{p_num} = {v:.0f} ms  ({role})")
 
     # Value distribution for key fields
     print(f"\n{'=' * 100}")
