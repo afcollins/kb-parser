@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Statistical analysis of OpenShift container metric JSON files (containerCPU.json, containerMemory.json).
+Statistical analysis of OpenShift metric JSON files with label-grouped time-series.
 
-Groups time-series values by label dimensions (container, namespace, node, pod),
+Supports any file with {timestamp, labels, value} records:
+  containerCPU.json, containerMemory.json, cgroupCPU.json, cgroupMemoryRSS.json,
+  nodeCPU-*.json, nodeMemoryUtilization-*.json, crioCPU.json, kubeletMemory.json, etc.
+
+Auto-detects label keys from the data, groups by each label dimension,
 computes per-group statistics (mean, std, CV, percentiles), clusters labels by
 magnitude and variability, and detects anomalies (spike ratios, top consumers).
 
 Usage:
     python3 container_stats.py containerCPU.json
-    python3 container_stats.py containerMemory.json
-    python3 container_stats.py /path/to/containerCPU.json /path/to/containerMemory.json
+    python3 container_stats.py cgroupCPU.json cgroupMemoryRSS.json
+    python3 container_stats.py nodeCPU-Workers.json nodeMemoryUtilization-Workers.json
 """
 import json
 import sys
@@ -117,8 +121,26 @@ def analyze_file(filepath):
     w = fmt_val_header(metric_type)
     fv = lambda v: fmt_val(v, metric_type)
 
-    # Group values by each label dimension
-    label_keys = ['container', 'namespace', 'node', 'pod']
+    # Auto-detect label keys from data
+    label_keys_set = set()
+    for entry in data[:200]:
+        labels = entry.get('labels', {})
+        label_keys_set.update(labels.keys())
+    # Filter out labels that are constant across all records (uninformative)
+    label_keys = []
+    for lk in sorted(label_keys_set):
+        unique = set()
+        for entry in data:
+            v = entry.get('labels', {}).get(lk)
+            if v is not None:
+                unique.add(v)
+            if len(unique) > 1:
+                break
+        if len(unique) > 1:
+            label_keys.append(lk)
+
+    print(f"Label dimensions: {label_keys}")
+
     groups = {lk: defaultdict(list) for lk in label_keys}
 
     for entry in data:
@@ -153,14 +175,20 @@ def analyze_file(filepath):
                   f"{fv(st['min']):>{w}} {fv(st['p25']):>{w}} {fv(st['median']):>{w}} "
                   f"{fv(st['p75']):>{w}} {fv(st['p95']):>{w}} {fv(st['max']):>{w}}")
 
-    # Clustering (container and namespace only)
+    # Clustering: pick label dimensions with 3-150 unique values (informative groupings)
     mag_bands = get_magnitude_bands(metric_type)
+
+    cluster_labels = [lk for lk in label_keys
+                      if 3 <= len(groups[lk]) <= 150]
+    if not cluster_labels:
+        # Fallback: pick the two labels with most unique values
+        cluster_labels = sorted(label_keys, key=lambda lk: len(groups[lk]), reverse=True)[:2]
 
     print(f"\n\n{'='*120}")
     print("STATISTICAL CLUSTERING - Grouping labels with similar behavior")
     print(f"{'='*120}")
 
-    for lk in ['container', 'namespace']:
+    for lk in cluster_labels:
         grp = groups[lk]
         all_stats = {}
         for lv, vals in grp.items():
@@ -200,19 +228,25 @@ def analyze_file(filepath):
                         print(f"    {lv:<55} mean={fv(st['mean'])}  CV={st['cv']:.1f}%  "
                               f"median={fv(st['median'])}  IQR={fv(st['iqr'])}")
 
-    # Anomaly detection
+    # Anomaly detection: use the label with most unique values in cluster range,
+    # or the first label with > 1 unique value
+    anomaly_label = cluster_labels[0] if cluster_labels else (label_keys[0] if label_keys else None)
+    if not anomaly_label:
+        print("\nNo label dimensions found for anomaly detection.")
+        return
+
     print(f"\n\n{'='*120}")
-    print("ANOMALY DETECTION")
+    print(f"ANOMALY DETECTION (by {anomaly_label})")
     print(f"{'='*120}")
 
-    container_stats = {}
-    for lv, vals in groups['container'].items():
+    anomaly_stats = {}
+    for lv, vals in groups[anomaly_label].items():
         st = compute_stats(vals)
         if st and st['n'] >= 3:
-            container_stats[lv] = st
+            anomaly_stats[lv] = st
 
-    print("\n--- Containers with highest spike ratio (max/mean > 3x) ---")
-    spikers = [(lv, st, st['max'] / st['mean']) for lv, st in container_stats.items() if st['mean'] > 0]
+    print(f"\n--- {anomaly_label} values with highest spike ratio (max/mean > 3x) ---")
+    spikers = [(lv, st, st['max'] / st['mean']) for lv, st in anomaly_stats.items() if st['mean'] > 0]
     spikers.sort(key=lambda x: x[2], reverse=True)
     for lv, st, ratio in spikers:
         if ratio > 3:
@@ -220,15 +254,15 @@ def analyze_file(filepath):
                   f"max={fv(st['max'])}  P95={fv(st['p95'])}")
 
     metric_label = "CPU" if metric_type == 'cpu' else "Memory"
-    print(f"\n--- Top 20 containers by P95 {metric_label} ---")
-    by_p95 = sorted(container_stats.items(), key=lambda x: x[1]['p95'], reverse=True)[:20]
+    print(f"\n--- Top 20 {anomaly_label} values by P95 {metric_label} ---")
+    by_p95 = sorted(anomaly_stats.items(), key=lambda x: x[1]['p95'], reverse=True)[:20]
     for lv, st in by_p95:
         print(f"  {lv:<55} P95={fv(st['p95'])}  mean={fv(st['mean'])}  "
               f"max={fv(st['max'])}  CV={st['cv']:.1f}%")
 
     min_mean = get_min_mean_threshold(metric_type)
-    print(f"\n--- Most predictable containers (lowest CV, mean > {fv(min_mean)}) ---")
-    predictable = [(lv, st) for lv, st in container_stats.items() if st['mean'] > min_mean]
+    print(f"\n--- Most predictable {anomaly_label} values (lowest CV, mean > {fv(min_mean)}) ---")
+    predictable = [(lv, st) for lv, st in anomaly_stats.items() if st['mean'] > min_mean]
     predictable.sort(key=lambda x: x[1]['cv'])
     for lv, st in predictable[:20]:
         print(f"  {lv:<55} CV={st['cv']:.1f}%  mean={fv(st['mean'])}  IQR={fv(st['iqr'])}")
@@ -237,7 +271,7 @@ def analyze_file(filepath):
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <file.json> [file2.json ...]")
-        print("  Accepts containerCPU.json and/or containerMemory.json files.")
+        print("  Accepts any metric JSON with {timestamp, labels, value} records.")
         sys.exit(1)
 
     for filepath in sys.argv[1:]:
