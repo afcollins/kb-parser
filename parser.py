@@ -42,7 +42,7 @@ class RenderConfig:
 try:
     import plotille
 except ImportError:
-    logging.warning("[!] Run 'pip install plotille' to enable terminal graphing.")
+    print("[!] Run 'pip install plotille' to enable terminal graphing.")
     plotille = None
 
 # Attempt to import plotly for browser visuals
@@ -50,7 +50,7 @@ try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 except ImportError:
-    logging.debug("[!] Run 'pip install plotly' to enable interactive browser graphing.")
+    print("[!] Run 'pip install plotly' to enable interactive browser graphing.")
     go = None
     make_subplots = None
 
@@ -62,7 +62,7 @@ try:
     def _json_load(f):
         return _orjson.loads(f.read())
 except ImportError:
-    logging.warning("[!] Run 'pip install orjson' for faster JSON parsing of large metric files.")
+    print("[!] Run 'pip install orjson' for faster JSON parsing of large metric files.")
     _orjson = None
     def _json_load(f):
         return json.load(f)
@@ -71,21 +71,21 @@ except ImportError:
 try:
     import ijson as _ijson
 except ImportError:
-    logging.warning("[!] Run 'pip install ijson' for streaming JSON parse on cold runs (lower memory).")
+    print("[!] Run 'pip install ijson' for streaming JSON parse on cold runs (lower memory).")
     _ijson = None
 
 # Use msgpack for binary cache files (faster reads/writes than JSON).
 try:
     import msgpack as _msgpack
 except ImportError:
-    logging.warning("[!] Run 'pip install msgpack' for faster cache reads/writes.")
+    print("[!] Run 'pip install msgpack' for faster cache reads/writes.")
     _msgpack = None
 
 # Use tqdm for progress bars on long streaming parse operations.
 try:
     import tqdm as _tqdm_mod
 except ImportError:
-    logging.warning("[!] Run 'pip install tqdm' to enable progress bars during cold parse.")
+    print("[!] Run 'pip install tqdm' to enable progress bars during cold parse.")
     _tqdm_mod = None
 
 # Logging verbosity — set from CLI args in __main__.
