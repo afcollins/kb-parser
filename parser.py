@@ -50,7 +50,6 @@ try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 except ImportError:
-    print("[!] Run 'pip install plotly' to enable interactive browser graphing.")
     go = None
     make_subplots = None
 
