@@ -293,6 +293,7 @@ def _load_cache(cache_path, source_mtime):
     # In-memory hit: same file, still valid for this source_mtime.
     mem = _mem_cache.get(cache_path)
     if mem is not None and mem[0] >= source_mtime:
+        _debug("memcache hit")
         return mem[1]
 
     def _try(path):
@@ -575,16 +576,6 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
     subset_path = (_metrics_cache_path(lat_path, effective_lf, latency_key=latency_key)
                    if has_filters else None)
 
-    # --- Subset cache fast path ---
-    if subset_path and not (tmin_sec is not None or tmax_sec is not None):
-        _subset = _load_cache(subset_path, source_mtime)
-        if (_subset and "values" in _subset and "timestamps" in _subset
-                and "labels" in _subset and "t0_raw" in _subset):
-            _info(f"  (latency subset cache loaded in {time.perf_counter()-_t0:.1f}s)")
-            _t0_raw = _subset["t0_raw"]
-            return [{"timestamp": ts, "elapsedTime": ts - _t0_raw, "value": v, "labels": lab}
-                    for v, ts, lab in zip(_subset["values"], _subset["timestamps"], _subset["labels"])]
-
     # --- Base cache warm path ---
     base_cached = _load_cache(cache_path, source_mtime)
     if base_cached is not None and "values" in base_cached and "t0_raw" in base_cached:
@@ -654,16 +645,6 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
     # Apply value range clip then time range filter via shared helpers.
     entries = clip_entries_to_range(entries, min_val, max_val)
     entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
-
-    # Write subset cache (values + timestamps + labels) for filtered combos without time range,
-    # so a subsequent warm run can skip the base cache entirely.
-    if subset_path and entries and not (tmin_sec is not None or tmax_sec is not None):
-        _save_cache(subset_path, {
-            "t0_raw":     t0_raw,
-            "values":     [e["value"]     for e in entries],
-            "timestamps": [e["timestamp"] for e in entries],
-            "labels":     [e["labels"]    for e in entries],
-        })
 
     return entries
 
@@ -1082,7 +1063,9 @@ def clip_entries_to_range(entries, min_val=None, max_val=None):
     """Filter entry dicts to those whose 'value' falls in [min_val, max_val]."""
     logging.debug("clip_entries_to_range")
     if min_val is None and max_val is None:
+        _debug("no values clip")
         return entries
+    _debug(f"values clip: {min_val} {max_val}")
     return [e for e in entries
             if (min_val is None or e["value"] >= min_val)
             and (max_val is None or e["value"] <= max_val)]
