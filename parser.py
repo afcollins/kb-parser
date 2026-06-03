@@ -3,7 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
-from dataclasses import dataclass, replace as dataclasses
+from dataclasses import dataclass, replace
 import io
 import datetime
 import enum
@@ -1342,6 +1342,27 @@ def _sample_label_keys(entries, sample=20):
     return sorted(keys)
 
 
+def _discover_group_values(filepath, group_key, label_filters=None, top_n=10):
+    """Return list of (group_value, count) for group_key, sorted by count descending."""
+    cache_path = _metrics_cache_path(filepath, label_filters)
+    source_mtime = os.path.getmtime(filepath)
+    cached = _load_cache(cache_path, source_mtime)
+    if cached:
+        card = cached.get("cardinality", {}).get("None-None-None-None", {})
+        counts = card.get(group_key, {})
+        if counts:
+            pairs = sorted(counts.items(), key=lambda x: -x[1])
+            return pairs[:top_n] if top_n else pairs
+    entries = load_generic_metrics(filepath, label_filters=label_filters,
+                                   return_entries=True, need_labels=True)
+    buckets = defaultdict(int)
+    for e in entries:
+        val = (e.get("labels") or {}).get(group_key)
+        buckets[str(val) if val is not None else "<missing>"] += 1
+    pairs = sorted(buckets.items(), key=lambda x: -x[1])
+    return pairs[:top_n] if top_n else pairs
+
+
 def _compute_group_stats(entries, group_key, top_n=None):
     """Partition entries by label key, compute stats per group.
 
@@ -1385,12 +1406,14 @@ def _print_group_stats_table(group_results, group_key, metric_name, total_count)
     sep = "\u2500" * len(hdr)
     print(hdr)
     print(sep)
+    def fmt(v):
+        return f"{v:>10.4g}"
     for gval, s in group_results:
         label = (gval[:24] + "..") if len(gval) > 26 else gval
         print(
-            f"{label:<32} {s['n']:>8,} {s['avg']:>10.4f} {s['p50']:>10.4f}"
-            f" {s['p90']:>10.4f} {s['p99']:>10.4f}"
-            f" {s['min']:>10.4f} {s['max']:>10.4f} {s['cv']:>10.3f}"
+            f"{label:<32} {s['n']:>8,} {fmt(s['avg'])} {fmt(s['p50'])}"
+            f" {fmt(s['p90'])} {fmt(s['p99'])}"
+            f" {fmt(s['min'])} {fmt(s['max'])} {s['cv']:>10.3f}"
         )
     print(sep)
 
@@ -1502,7 +1525,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     # TODO delete metric_name as is unused
     display_name = metric_name or os.path.basename(filepath)
     title_suffix = f" — {display_name}" if display_name else ""
-    if label_filters:
+    if label_filters and "[" not in display_name:
         title_suffix += " " + str(label_filters)
 
     if values_presorted:
@@ -1834,7 +1857,7 @@ if __name__ == "__main__":
             if use_agg_path:
                 result = run_generic_metrics_analysis(
                     filepath,
-                    dataclasses.replace(cfg, no_visuals=True),
+                    replace(cfg, no_visuals=True),
                     metric_name=metric_name,
                     label_filters=label_filters or None,
                     min_val=args.min,
@@ -1863,6 +1886,25 @@ if __name__ == "__main__":
                     tmax_sec=args.tmax,
                     fragment_id=fragment_id,
                 )
+
+            if cfg.group_by and not cfg.no_visuals:
+                group_values = _discover_group_values(
+                    filepath, cfg.group_by,
+                    label_filters=label_filters or None,
+                    top_n=cfg.top_labels)
+                group_cfg = replace(cfg, group_by=None)
+                for gval, _count in group_values:
+                    group_label_filters = dict(label_filters or {})
+                    group_label_filters[cfg.group_by] = gval
+                    group_name = f"{metric_name} [{cfg.group_by}={gval}]"
+                    run_generic_metrics_analysis(
+                        filepath, group_cfg,
+                        metric_name=group_name,
+                        label_filters=group_label_filters,
+                        min_val=args.min, max_val=args.max,
+                        tmin_sec=args.tmin, tmax_sec=args.tmax,
+                        fragment_id=fragment_id,
+                    )
 
         if use_agg_path and not cfg.no_visuals and agg_series:
             title = resolved_targets[0][1] if len(resolved_targets) == 1 else "metrics"
