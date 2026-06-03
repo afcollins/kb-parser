@@ -662,6 +662,12 @@ def extract_log_metrics(msg_content):
     }
     return {k: (int(v.group(1)) if v else 0) for k, v in metrics.items()}
 
+def _resolve_direct_file(arg):
+    for candidate in (arg, arg + ".json", arg + ".json.gz"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
 def find_pairs_recursively(fragments):
     pairs = []
     for root, dirs, files in os.walk('.'):
@@ -1697,8 +1703,9 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Suppress all diagnostic output; show only stats tables and graphs.")
     parser.add_argument("positionals", nargs="*",
-                        help="UUID fragment(s) plus optional 'metrics' keyword and metric file name(s) in any order "
-                             "(e.g. '2178a534 metrics containerCPU' or 'metrics containerCPU 2178a534').")
+                        help="Direct metric file path(s), or UUID fragment(s) with optional 'metrics' keyword "
+                             "and metric file name(s). Examples: 'containerCPU.json', "
+                             "'2178a534 metrics containerCPU'.")
 
     args = parser.parse_args()
     if args.verbose:
@@ -1734,28 +1741,38 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
-    # Classify positionals:
-    #   'metrics'  → enables metrics mode
-    #   everything else → candidates (UUID fragments or metric file names)
-    # To tell UUIDs from metric files: run discovery on all candidates; anything that
-    # matches a real .log or collected-metrics-* entry is a UUID fragment, the rest are
-    # metric file names.  The caller guarantees no collision between the two sets.
+    # Classify positionals into three buckets:
+    #   1. direct_files  — args that resolve to an existing file on disk
+    #   2. fragments     — args that match a .log or collected-metrics-* via discovery
+    #   3. metric_files  — remaining args (only when 'metrics' keyword present)
     run_metrics = "metrics" in positionals
     candidates = [p for p in positionals if p != "metrics"]
 
+    direct_files = []
+    fragment_candidates = []
+    for c in candidates:
+        resolved = _resolve_direct_file(c)
+        if resolved:
+            direct_files.append(resolved)
+        else:
+            fragment_candidates.append(c)
+
     discovered_pairs = []
-    if candidates:
-        discovered_pairs = find_pairs_recursively(candidates)
+    if fragment_candidates:
+        discovered_pairs = find_pairs_recursively(fragment_candidates)
     matched_fragments = {pair["fragment"] for pair in discovered_pairs}
 
-    fragments    = [c for c in candidates if c in matched_fragments]
-    metric_files = [c for c in candidates if c not in matched_fragments] if run_metrics else []
+    fragments    = [c for c in fragment_candidates if c in matched_fragments]
+    metric_files = [c for c in fragment_candidates if c not in matched_fragments] if run_metrics else []
 
-    if not fragments and not metric_files:
+    if direct_files:
+        run_metrics = True
+
+    if not fragments and not metric_files and not direct_files:
         parser.print_help()
         sys.exit(1)
 
-    if run_metrics and not metric_files:
+    if run_metrics and not metric_files and not direct_files:
         print("[!] 'metrics' requires at least one metric file name after it.", file=sys.stderr)
         parser.print_help()
         sys.exit(1)
@@ -1774,73 +1791,87 @@ if __name__ == "__main__":
                            field_filters=label_filters or None,
                            tmin_sec=args.tmin, tmax_sec=args.tmax)
 
-    if run_metrics and metric_files:
-        if not discovered_pairs:
-            print(f"[!] No collected-metrics dirs found — cannot locate metric files.", file=sys.stderr)
-            sys.exit(1)
-        use_agg_path = args.agg or args.plotly
-        for raw_file in metric_files:
-            if raw_file.endswith(".json") or raw_file.endswith(".json.gz"):
-                metric_file = raw_file
-            else:
-                metric_file = raw_file + ".json"
-            # TODO remove metric_name
-            display_base = getattr(args, "metric_name", None) or os.path.splitext(
-                metric_file[:-3] if metric_file.endswith('.gz') else metric_file)[0]
-            agg_series = []
-            for pair in discovered_pairs:
-                if not pair.get("metrics_dir"):
-                    continue
-                filepath = os.path.join(pair["metrics_dir"], metric_file)
-                if not os.path.isfile(filepath):
-                    # Try .json.gz fallback if .json not found
-                    gz_path = filepath + ".gz" if not filepath.endswith(".gz") else None
-                    if gz_path and os.path.isfile(gz_path):
-                        filepath = gz_path
-                    else:
-                        print(f"[!] Not found: {filepath}", file=sys.stderr)
-                        continue
-                metric_name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
-                if use_agg_path:
-                    result = run_generic_metrics_analysis(
-                        filepath,
-                        dataclasses.replace(cfg, no_visuals=True),
-                        metric_name=metric_name,
-                        label_filters=label_filters or None,
-                        min_val=args.min,
-                        max_val=args.max,
-                        tmin_sec=args.tmin,
-                        tmax_sec=args.tmax,
-                        _collect=True,
-                        fragment_id=pair["fragment"],
-                    )
-                    if result:
-                        sorted_vals, entries = result
-                        agg_series.append({
-                            "sorted_vals": sorted_vals,
-                            "entries":     entries,
-                            "label":       pair["fragment"][:8],
-                            "color":       _SERIES_COLORS[len(agg_series) % len(_SERIES_COLORS)],
-                        })
-                else:
-                    run_generic_metrics_analysis(
-                        filepath, cfg,
-                        metric_name=metric_name,
-                        label_filters=label_filters or None,
-                        min_val=args.min,
-                        max_val=args.max,
-                        tmin_sec=args.tmin,
-                        tmax_sec=args.tmax,
-                        fragment_id=pair["fragment"],
-                    )
+    # Build resolved (filepath, display_name, fragment_id) list from both
+    # direct files and UUID-discovered metric files, then process uniformly.
+    if run_metrics and (metric_files or direct_files):
+        resolved_targets = []
 
-            if use_agg_path and not cfg.no_visuals and agg_series:
-                if cfg.plotly:
-                    _render_plots_plotly(agg_series, cfg, title_suffix=display_base)
+        for df in direct_files:
+            base = os.path.splitext(os.path.basename(df))[0]
+            if df.endswith('.gz'):
+                base = os.path.splitext(base)[0]
+            resolved_targets.append((df, base, None))
+
+        if metric_files:
+            if not discovered_pairs:
+                print(f"[!] No collected-metrics dirs found — cannot locate metric files.", file=sys.stderr)
+                sys.exit(1)
+            for raw_file in metric_files:
+                if raw_file.endswith(".json") or raw_file.endswith(".json.gz"):
+                    metric_file = raw_file
                 else:
-                    _render_metrics_plotille_agg(
-                        agg_series, cfg, display_base, args.min, args.max
-                    )
+                    metric_file = raw_file + ".json"
+                # TODO remove metric_name
+                display_base = getattr(args, "metric_name", None) or os.path.splitext(
+                    metric_file[:-3] if metric_file.endswith('.gz') else metric_file)[0]
+                for pair in discovered_pairs:
+                    if not pair.get("metrics_dir"):
+                        continue
+                    filepath = os.path.join(pair["metrics_dir"], metric_file)
+                    if not os.path.isfile(filepath):
+                        gz_path = filepath + ".gz" if not filepath.endswith(".gz") else None
+                        if gz_path and os.path.isfile(gz_path):
+                            filepath = gz_path
+                        else:
+                            print(f"[!] Not found: {filepath}", file=sys.stderr)
+                            continue
+                    name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
+                    resolved_targets.append((filepath, name, pair["fragment"]))
+
+        use_agg_path = args.agg or args.plotly
+        agg_series = []
+        for filepath, metric_name, fragment_id in resolved_targets:
+            if use_agg_path:
+                result = run_generic_metrics_analysis(
+                    filepath,
+                    dataclasses.replace(cfg, no_visuals=True),
+                    metric_name=metric_name,
+                    label_filters=label_filters or None,
+                    min_val=args.min,
+                    max_val=args.max,
+                    tmin_sec=args.tmin,
+                    tmax_sec=args.tmax,
+                    _collect=True,
+                    fragment_id=fragment_id,
+                )
+                if result:
+                    sorted_vals, entries = result
+                    agg_series.append({
+                        "sorted_vals": sorted_vals,
+                        "entries":     entries,
+                        "label":       (fragment_id or metric_name)[:8] if len(resolved_targets) > 1 else metric_name,
+                        "color":       _SERIES_COLORS[len(agg_series) % len(_SERIES_COLORS)],
+                    })
+            else:
+                run_generic_metrics_analysis(
+                    filepath, cfg,
+                    metric_name=metric_name,
+                    label_filters=label_filters or None,
+                    min_val=args.min,
+                    max_val=args.max,
+                    tmin_sec=args.tmin,
+                    tmax_sec=args.tmax,
+                    fragment_id=fragment_id,
+                )
+
+        if use_agg_path and not cfg.no_visuals and agg_series:
+            title = resolved_targets[0][1] if len(resolved_targets) == 1 else "metrics"
+            if cfg.plotly:
+                _render_plots_plotly(agg_series, cfg, title_suffix=title)
+            else:
+                _render_metrics_plotille_agg(
+                    agg_series, cfg, title, args.min, args.max
+                )
     _t0 = time.perf_counter()
     _mem_cache.clear()
     _elapsed = time.perf_counter() - _t0
