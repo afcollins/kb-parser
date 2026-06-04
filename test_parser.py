@@ -145,6 +145,30 @@ class TestPrintGroupStatsTable:
         assert "e+" not in out
 
 
+# ---------- _print_stats_table ----------
+
+class TestPrintStatsTable:
+    def test_header_and_footer_same_width(self, capsys):
+        P._print_stats_table("METRICS: containerCPU", 100, 0.5, 0.1, 0.2,
+                             0.4, 0.8, 0.95, min_val=0.01, max_val=1.0)
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        header = lines[0]
+        footer = lines[-1]
+        strip_ansi = lambda s: s.replace("\033[1;34m", "").replace("\033[0m", "")
+        assert len(strip_ansi(header)) == len(strip_ansi(footer))
+
+    def test_long_title_bars_align(self, capsys):
+        long_title = "METRICS: containerCPU [container=kube-rbac-proxy-very-long-name]"
+        P._print_stats_table(long_title, 50, 1.0, 0.5, 0.5,
+                             0.9, 1.5, 2.0, min_val=0.1, max_val=3.0)
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        strip_ansi = lambda s: s.replace("\033[1;34m", "").replace("\033[0m", "")
+        header = strip_ansi(lines[0])
+        footer = strip_ansi(lines[-1])
+        assert len(header) == len(footer)
+        assert long_title in header
+
+
 # ---------- _compute_stats ----------
 
 class TestComputeStats:

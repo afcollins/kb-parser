@@ -812,7 +812,12 @@ def _print_stats_table(title, n, avg, stdev, cv, p50, p90, p99,
     def fmt(v):
         return f"{v:.4g}" if isinstance(v, (int, float)) else str(v)
     u = unit
-    print(f"\n\033[1;34m" + "=" * 50 + f" {title} " + "=" * 50 + "\033[0m")
+    inner = len(title) + 2  # space + title + space
+    bar_width = max(110, inner + 4)
+    left_pad = (bar_width - inner) // 2
+    right_pad = bar_width - inner - left_pad
+    header = "=" * left_pad + f" {title} " + "=" * right_pad
+    print(f"\n\033[1;34m{header}\033[0m")
     print(f"  N = {n}  |  avg = {fmt(avg)}{u}  |  stdev = {fmt(stdev)}  |  CV = {fmt(cv)}")
     parts = []
     if min_val is not None:
@@ -823,7 +828,7 @@ def _print_stats_table(title, n, avg, stdev, cv, p50, p90, p99,
     print("  " + "  |  ".join(parts))
     for line in (extra_lines or []):
         print(f"  {line}")
-    print("\033[1;34m" + "=" * 110 + "\033[0m")
+    print("\033[1;34m" + "=" * bar_width + "\033[0m")
 
 
 def _plot_frequency_histogram(sorted_lats, cfg):
