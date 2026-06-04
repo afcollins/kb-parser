@@ -1610,10 +1610,9 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
         min_val=min(display_vals), max_val=max(display_vals), extra_lines=extra,
     )
 
-    # Show label cardinality only when --source is explicitly requested.
-    # range_key and cached_card were computed before the load_generic_metrics call
-    # so a warm cache hit avoids re-reading the source file entirely.
     if cfg.source:
+        range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
+        cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
         if cached_card:
             logging.info("  (cardinality cache loaded)")
             _print_cardinality(cached_card, top_n=cfg.top_labels)

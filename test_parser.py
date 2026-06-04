@@ -302,6 +302,11 @@ class TestCLIPodLatency:
         assert rc == 0
         assert "METRICS:" in out
 
+    def test_direct_latency_with_source_flag(self):
+        rc, out, err = _run_parser(LAT_JSON, "-S", "--no-visuals")
+        assert rc == 0
+        assert "METRICS:" in out
+
 
 class TestLoadMetricsData:
     def test_generic_returns_values(self):
