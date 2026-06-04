@@ -1463,10 +1463,61 @@ def _write_group_stats_csv(group_results, group_key, metric_name, fragment_id):
         return None
 
 
+def _load_metrics_data(filepath, cfg, label_filters=None,
+                       min_val=None, max_val=None,
+                       tmin_sec=None, tmax_sec=None, latency_key=None):
+    """Load metric values from file, returning (entries, values, presorted).
+
+    Routes to _load_lat_metrics_normalized for podLatencyMeasurement files
+    (when latency_key is set), otherwise uses load_generic_metrics.
+    """
+    if latency_key:
+        lf = {k: str(v) for k, v in label_filters.items()} if label_filters else None
+        entries = _load_lat_metrics_normalized(filepath, latency_key,
+                                               field_filters=lf,
+                                               min_val=min_val, max_val=max_val,
+                                               tmin_sec=tmin_sec, tmax_sec=tmax_sec)
+        values = [e["value"] for e in entries] if entries else []
+        return entries, values, False
+
+    cache_path = _metrics_cache_path(filepath, label_filters)
+    source_mtime = os.path.getmtime(filepath)
+    logging.info(f"_metrics_cache_path: {cache_path}")
+
+    range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
+    cached_card = None
+    if cfg.source:
+        cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
+
+    need_labels = (cfg.source and cached_card is None) or bool(cfg.group_by)
+    need_entries = cfg.scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
+    logging.debug(f"need_entries={need_entries}")
+
+    entries = None
+    if need_entries:
+        logging.info("need_entries path")
+        entries = load_generic_metrics(filepath, label_filters=label_filters,
+                                        return_entries=True, need_labels=need_labels)
+        if tmin_sec is not None or tmax_sec is not None:
+            original_n = len(entries)
+            entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
+            if not entries:
+                return None, [], False
+            logging.info(f"time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries")
+        values = [e["value"] for e in entries]
+        presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
+    else:
+        logging.info("values-only path")
+        values = load_generic_metrics(filepath, label_filters=label_filters)
+        presorted = True
+
+    return entries, values, presorted
+
+
 def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=None,
                                   min_val=None, max_val=None,
                                   tmin_sec=None, tmax_sec=None, _collect=False,
-                                  fragment_id=None):
+                                  fragment_id=None, latency_key=None):
     """
     Run histogram, CDF, and CV (and summary stats) on a metrics JSON file that has
     objects with 'value' and optional 'labels'. Use label_filters to restrict
@@ -1480,46 +1531,13 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
     logging.info("run_generic_metrics_analysis")
-    # Raw entries (with timestamps) are needed for scatter (--scatter), label source
-    # lookup (--source), or time filtering.  Histogram and CDF run from cached values
-    # alone, so the default path hits the cache without touching the source file.
-    cache_path = _metrics_cache_path(filepath, label_filters)
+    entries, values, values_presorted = _load_metrics_data(
+        filepath, cfg, label_filters=label_filters,
+        min_val=min_val, max_val=max_val,
+        tmin_sec=tmin_sec, tmax_sec=tmax_sec,
+        latency_key=latency_key)
+    cache_path = _metrics_cache_path(filepath, label_filters, latency_key=latency_key)
     source_mtime = os.path.getmtime(filepath)
-    logging.info(f"_metrics_cache_path: {cache_path}")
-
-    # Pre-check cardinality cache so we avoid forcing a cold source parse just for
-    # -S when the result is already stored.  need_labels stays False on a warm hit.
-    range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
-    cached_card = None
-    if cfg.source:
-        cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
-
-    need_labels = (cfg.source and cached_card is None) or bool(cfg.group_by)
-    need_entries = cfg.scatter or need_labels or (tmin_sec is not None or tmax_sec is not None)
-    logging.debug(f"need_entries={need_entries}")
-
-    entries = None
-    if need_entries:
-        logging.info("not _subset_fast_path and does need_entries")
-        entries = load_generic_metrics(filepath, label_filters=label_filters,
-                                        return_entries=True, need_labels=need_labels)
-        if tmin_sec is not None or tmax_sec is not None:
-            original_n = len(entries)
-            entries = clip_entries_to_time_range(entries, tmin_sec, tmax_sec)
-            if not entries:
-                return
-            logging.info(f"time window [{tmin_sec}s, {tmax_sec}s]: {len(entries)}/{original_n} entries")
-        _t0 = time.perf_counter()
-        values = [e["value"] for e in entries]
-        logging.debug(f"  (extracted {len(values):,} values in {time.perf_counter()-_t0:.2f}s)")
-        # Pre-sorted when entries came from cache in value order (no time-filter, no
-        # cold label parse). Time-filter picks a non-contiguous subset; a cold
-        # need_labels parse returns file order — neither is guaranteed sorted.
-        values_presorted = not need_labels and (tmin_sec is None and tmax_sec is None)
-    else:
-        logging.info("not _subset_fast_path and does not need_entries")
-        values = load_generic_metrics(filepath, label_filters=label_filters)
-        values_presorted = True   # load_generic_metrics caches sorted values
 
     if not values:
         print(f"[!] No values found in {filepath}" + (
@@ -1543,9 +1561,10 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     n = len(sorted_vals)
 
     _t0 = time.perf_counter()
+    _expected_keys = {"avg", "stdev", "cv", "p50", "p90", "p99"}
     cached_stats = _get_cached_stats(cache_path, source_mtime)
     logging.debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
-    if cached_stats:
+    if cached_stats and _expected_keys <= cached_stats.keys():
         avg   = cached_stats["avg"]
         stdev = cached_stats["stdev"]
         cv    = cached_stats["cv"]
@@ -1553,6 +1572,9 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
         p90   = cached_stats["p90"]
         p99   = cached_stats["p99"]
     else:
+        if cached_stats:
+            logging.warning(f"Stale stats cache format in {cache_path} — recomputing. "
+                            f"Delete .kbcache files to silence this.")
         _t0 = time.perf_counter()
         with _spinner(desc="  Computing stats", show_timer=True):
             _s = _compute_stats(sorted_vals)
@@ -1828,7 +1850,8 @@ if __name__ == "__main__":
             base = os.path.splitext(os.path.basename(df))[0]
             if df.endswith('.gz'):
                 base = os.path.splitext(base)[0]
-            resolved_targets.append((df, base, None))
+            lat_key = args.latency_type if "podLatencyMeasurement" in df else None
+            resolved_targets.append((df, base, None, lat_key))
 
         if metric_files:
             if not discovered_pairs:
@@ -1854,11 +1877,12 @@ if __name__ == "__main__":
                             print(f"[!] Not found: {filepath}", file=sys.stderr)
                             continue
                     name = display_base if len(discovered_pairs) == 1 else f"{display_base} ({pair['fragment']})"
-                    resolved_targets.append((filepath, name, pair["fragment"]))
+                    lat_key = args.latency_type if "podLatencyMeasurement" in filepath else None
+                    resolved_targets.append((filepath, name, pair["fragment"], lat_key))
 
         use_agg_path = args.agg or args.plotly
         agg_series = []
-        for filepath, metric_name, fragment_id in resolved_targets:
+        for filepath, metric_name, fragment_id, lat_key in resolved_targets:
             if use_agg_path:
                 result = run_generic_metrics_analysis(
                     filepath,
@@ -1871,6 +1895,7 @@ if __name__ == "__main__":
                     tmax_sec=args.tmax,
                     _collect=True,
                     fragment_id=fragment_id,
+                    latency_key=lat_key,
                 )
                 if result:
                     sorted_vals, entries = result
@@ -1890,6 +1915,7 @@ if __name__ == "__main__":
                     tmin_sec=args.tmin,
                     tmax_sec=args.tmax,
                     fragment_id=fragment_id,
+                    latency_key=lat_key,
                 )
 
             if cfg.group_by and not cfg.no_visuals:
@@ -1909,6 +1935,7 @@ if __name__ == "__main__":
                         min_val=args.min, max_val=args.max,
                         tmin_sec=args.tmin, tmax_sec=args.tmax,
                         fragment_id=fragment_id,
+                        latency_key=lat_key,
                     )
 
         if use_agg_path and not cfg.no_visuals and agg_series:

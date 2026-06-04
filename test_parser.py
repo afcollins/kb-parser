@@ -16,6 +16,7 @@ METRICS_DIR = os.path.join(TESTDATA_DIR,
     "collected-metrics-2178a534-fce2-4d66-839b-d874c01dc630")
 CPU_JSON = os.path.join(METRICS_DIR, "containerCPU.json")
 CPU_GZ = os.path.join(METRICS_DIR, "containerCPU.json.gz")
+LAT_JSON = os.path.join(METRICS_DIR, "podLatencyMeasurement-node-density.json")
 
 
 # ---------- _resolve_direct_file ----------
@@ -280,6 +281,43 @@ class TestCLIGroupBy:
         rc, out, err = _run_parser(CPU_JSON, "--group-by", "nonexistent_xyz",
                                    "--no-visuals")
         assert rc == 0  # should not crash
+
+
+class TestCLIPodLatency:
+    def test_direct_latency_file(self):
+        rc, out, err = _run_parser(LAT_JSON, "--no-visuals")
+        assert rc == 0
+        assert "METRICS:" in out
+        assert "N = " in out
+
+    def test_direct_latency_with_latency_type(self):
+        rc, out, err = _run_parser(LAT_JSON, "-L", "schedulingLatency",
+                                   "--no-visuals")
+        assert rc == 0
+        assert "N = " in out
+
+    def test_direct_latency_without_extension(self):
+        base = os.path.join(METRICS_DIR, "podLatencyMeasurement-node-density")
+        rc, out, err = _run_parser(base, "--no-visuals")
+        assert rc == 0
+        assert "METRICS:" in out
+
+
+class TestLoadMetricsData:
+    def test_generic_returns_values(self):
+        cfg = P.RenderConfig()
+        entries, values, presorted = P._load_metrics_data(CPU_JSON, cfg)
+        assert len(values) > 0
+        assert presorted is True
+        assert entries is None  # values-only path
+
+    def test_latency_returns_values(self):
+        cfg = P.RenderConfig()
+        entries, values, presorted = P._load_metrics_data(
+            LAT_JSON, cfg, latency_key="podReadyLatency")
+        assert len(values) > 0
+        assert entries is not None
+        assert presorted is False
 
 
 class TestCLILabelFilter:
