@@ -11,25 +11,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Requires **Python 3.11+** (for full `fromisoformat` support; older versions emit a warning and use a compatibility shim).
 
 ```bash
-source ~/.venv/kb-parser/bin/activate
-pip install plotille==5.0.0 tqdm ijson msgpack orjson
-chmod +x parser.py
+# Install as CLI tools (no venv sourcing needed afterwards)
+make install          # runs: uv tool install --force .
+
+# Or manually:
+uv tool install .     # installs kb-parser, container-stats, pod-latency-stats
 ```
 
 ## Test Commands
 
 ```bash
-# Latency mode
-./parser.py 2178a534 --no-visuals
-./parser.py 2178a534 -s -t 0,10
-./parser.py 2178a534 -b ,3000 --no-visuals
-./parser.py 2178a534 -S --no-visuals
+make test             # runs: uv run --extra test pytest test_parser.py -v
 
-# Metrics mode
-./parser.py 2178a534 metrics containerCPU --no-visuals
-./parser.py 2178a534 metrics containerCPU --top-labels 20 -S
-./parser.py 2178a534 metrics containerCPU -b ,0.05 --no-visuals
-./parser.py 2178a534 metrics containerCPU -t 3621,6036 --no-visuals
+# Direct file mode (no UUID required)
+kb-parser containerCPU.json --no-visuals
+kb-parser podLatencyMeasurement-workload.json --no-visuals
+kb-parser containerCPU.json --group-by container --top-labels 5
+
+# Latency mode (UUID fragment discovery)
+kb-parser 2178a534 --no-visuals
+kb-parser 2178a534 -s -t 0,10
+kb-parser 2178a534 -b ,3000 --no-visuals
+kb-parser 2178a534 -S --no-visuals
+
+# Metrics mode (UUID + metric file names)
+kb-parser 2178a534 metrics containerCPU --no-visuals
+kb-parser 2178a534 metrics containerCPU --top-labels 20 -S
+kb-parser 2178a534 metrics containerCPU -b ,0.05 --no-visuals
+kb-parser 2178a534 metrics containerCPU -t 3621,6036 --no-visuals
 ```
 
 Test data lives under directories matched by the fragment `2178a534`. Large test data files are excluded from Claude's context via `.claudeignore`.
@@ -40,7 +49,7 @@ Single file: **`parser.py`**.
 
 ### Invocation
 
-Positionals are classified by content, not position: `metrics` (literal) enables metrics mode; any arg matching a real `.log` / `collected-metrics-*` entry is a UUID fragment; remaining args (when `metrics` is present) are metric file names.
+Positionals are classified by content, not position: if an argument resolves to an existing file on disk (with `.json` / `.json.gz` auto-appended), it is treated as a direct file path; `metrics` (literal) enables metrics mode; any arg matching a real `.log` / `collected-metrics-*` entry is a UUID fragment; remaining args (when `metrics` is present) are metric file names. Files containing `podLatencyMeasurement` in the name are automatically routed through the latency loader.
 
 ### Key Data Flow
 
@@ -73,8 +82,13 @@ All optional deps (plotille, tqdm, ijson, msgpack, orjson) degrade gracefully wh
 
 ## Standalone Analysis Scripts
 
+All scripts are installable as CLI tools via `pyproject.toml` (`make install`).
+
 ### analyze.py
 Reads the `max-*.json`, `cpu-*.json`, and `memory-*.json` summary metric files from a collected-metrics directory. Produces per-category breakdowns (CPU, Memory, Etcd, API latency), spike detection, etcd health assessment, cluster utilization summary, and optional cross-run comparison (`python3 analyze.py /path/to/other`).
 
-### container_stats.py
-Statistical analysis of per-container time-series JSON files (`containerCPU.json`, `containerMemory.json`). Auto-detects metric type; uses scientific notation for memory (bytes) and decimal for CPU (cores). Groups by label dimension (container, namespace, node, pod), clusters by magnitude x variability (CV), and detects anomalies (spike ratios, top consumers). Usage: `python3 container_stats.py <file.json> [file2.json ...]`.
+### container_stats.py (`container-stats`)
+Statistical analysis of per-container time-series JSON files (`containerCPU.json`, `containerMemory.json`). Auto-detects metric type; uses scientific notation for memory (bytes) and decimal for CPU (cores). Groups by label dimension (container, namespace, node, pod), clusters by magnitude x variability (CV), and detects anomalies (spike ratios, top consumers). Usage: `container-stats <file.json> [file2.json ...]`.
+
+### pod_latency_stats.py (`pod-latency-stats`)
+Analyzes podLatencyMeasurement JSON files, producing percentile band reports and CSV output. Usage: `pod-latency-stats [--csv-only] <file.json> [file2.json ...]`.
