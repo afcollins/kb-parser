@@ -1,4 +1,8 @@
-.PHONY: test
+.PHONY: install test
+
+install:
+	uv cache clean kb-parser
+	uv tool install --force .
 
 test:
-	python3 -m pytest test_parser.py -v
+	uv run --extra test pytest test_parser.py -v

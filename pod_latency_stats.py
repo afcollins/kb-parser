@@ -10,6 +10,7 @@ Usage:
     python3 pod_latency_stats.py run1/podLatency*.json run2/podLatency*.json
     python3 pod_latency_stats.py --csv-only podLatency*.json   # CSV output only, no report
 """
+import argparse
 import csv
 import json
 import os
@@ -269,28 +270,24 @@ def write_csv(all_results, csv_path):
 
 
 def main():
-    csv_only = False
-    filepaths = []
-    for arg in sys.argv[1:]:
-        if arg == '--csv-only':
-            csv_only = True
-        else:
-            filepaths.append(arg)
-
-    if not filepaths:
-        print(f"Usage: {sys.argv[0]} [--csv-only] <file.json> [file2.json ...]")
-        print("  Analyzes podLatencyMeasurement JSON files and outputs report + CSV.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Analyze podLatencyMeasurement JSON files and output report + CSV"
+    )
+    parser.add_argument('--csv-only', action='store_true',
+                        help='CSV output only, no report')
+    parser.add_argument('files', nargs='+', metavar='file.json',
+                        help='one or more podLatencyMeasurement JSON files')
+    args = parser.parse_args()
 
     all_results = []
-    for filepath in filepaths:
+    for filepath in args.files:
         metadata, field_results = analyze_file(filepath)
         all_results.extend(field_results)
-        if not csv_only:
+        if not args.csv_only:
             print_report(metadata, field_results)
 
     # Write CSV next to the first input file
-    first_dir = os.path.dirname(os.path.abspath(filepaths[0]))
+    first_dir = os.path.dirname(os.path.abspath(args.files[0]))
     csv_path = os.path.join(first_dir, 'podLatency-percentile-bands.csv')
     write_csv(all_results, csv_path)
 

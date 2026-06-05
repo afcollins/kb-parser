@@ -1694,7 +1694,7 @@ def _parse_bucket_arg(raw_str, flag_name):
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Parse kube-burner metrics and produce CSV reports.",
         epilog="%(prog)s UUID  — latency analysis.  "
@@ -1950,3 +1950,7 @@ if __name__ == "__main__":
     _elapsed = time.perf_counter() - _t0
     if _elapsed > 0.1:
         _info(f"(cache freed in {_elapsed:.1f}s)")
+
+
+if __name__ == "__main__":
+    main()

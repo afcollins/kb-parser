@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb-parser"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "plotille==5.0.0",
+    "tqdm",
+    "ijson",
+    "msgpack",
+    "orjson",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+py-modules = ["parser", "container_stats", "pod_latency_stats"]
+
+[project.scripts]
+kb-parser = "parser:main"
+container-stats = "container_stats:main"
+pod-latency-stats = "pod_latency_stats:main"

@@ -15,6 +15,7 @@ Usage:
     python3 container_stats.py cgroupCPU.json cgroupMemoryRSS.json
     python3 container_stats.py nodeCPU-Workers.json nodeMemoryUtilization-Workers.json
 """
+import argparse
 import json
 import sys
 import statistics
@@ -269,12 +270,16 @@ def analyze_file(filepath):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file.json> [file2.json ...]")
-        print("  Accepts any metric JSON with {timestamp, labels, value} records.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Statistical analysis of per-container time-series JSON files"
+    )
+    parser.add_argument(
+        "files", nargs="+", metavar="file.json",
+        help="one or more metric JSON files with {timestamp, labels, value} records"
+    )
+    args = parser.parse_args()
 
-    for filepath in sys.argv[1:]:
+    for filepath in args.files:
         analyze_file(filepath)
 
 
