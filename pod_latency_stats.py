@@ -103,6 +103,12 @@ def analyze_field(vals_sorted, field_name):
         avg_std = (result['band1_std'] + result['band2_std']) / 2
         result['separation_quality'] = result['gap'] / avg_std if avg_std > 0 else float('inf')
 
+        result['is_bimodal'] = (
+            result['separation_quality'] > 2.0
+            and result['band1_pct'] > 5.0
+            and result['band2_pct'] > 5.0
+        )
+
         # Per-band percentiles
         for p in RECOMMENDED_PERCENTILES:
             result[f'band1_P{p}'] = compute_percentile(low, p)
@@ -125,6 +131,7 @@ def analyze_field(vals_sorted, field_name):
                      'band2_std', 'band2_min', 'band2_max', 'band2_cv', 'gap',
                      'separation_quality']:
             result[key] = ''
+        result['is_bimodal'] = False
         for p in RECOMMENDED_PERCENTILES:
             result[f'band1_P{p}'] = ''
             result[f'band2_P{p}'] = ''
@@ -154,7 +161,9 @@ def analyze_file(filepath):
 
     field_results = []
     for field in LATENCY_FIELDS:
-        vals = sorted(float(entry[field]) for entry in data)
+        vals = sorted(float(entry[field]) for entry in data if field in entry)
+        if not vals:
+            continue
         result = analyze_field(vals, field)
         result.update(metadata)
         field_results.append(result)
@@ -178,7 +187,7 @@ def print_report(metadata, field_results):
               f"Median={r['P50']:.0f}  P75={r['P75']:.0f}  P95={r['P95']:.0f}  "
               f"P99={r['P99']:.0f}  Max={r['max']:.0f}")
 
-        if r['split_point'] is not None and r['split_point'] != '':
+        if r.get('is_bimodal'):
             print(f"\n    Bimodal split at {r['split_point']:.0f} ms  "
                   f"(separation quality: {r['separation_quality']:.2f})")
             print(f"    Band 1 (fast): N={r['band1_n']} ({r['band1_pct']:.1f}%)  "
@@ -197,7 +206,6 @@ def print_report(metadata, field_results):
                           f"value={r[f'transition_{rank}_value_ms']:.0f}ms")
 
             print(f"\n    Recommended percentiles:")
-            # Build from actual CDF transitions
             transition_pcts = []
             for rank in range(1, 6):
                 tp = r.get(f'transition_{rank}_percentile', '')
@@ -221,6 +229,8 @@ def print_report(metadata, field_results):
                 v = pct_map.get(p_num)
                 if v is not None:
                     print(f"      P{p_num} = {v:.0f} ms  ({role})")
+        else:
+            print(f"    Distribution: unimodal")
 
     # Value distribution for key fields
     print(f"\n{'=' * 100}")
@@ -243,7 +253,7 @@ def write_csv(all_results, csv_path):
     meta_cols = ['file', 'uuid', 'jobName', 'ocp_version', 'total_records']
     stat_cols = ['field', 'n', 'mean', 'std', 'cv', 'min', 'max', 'unique_values']
     pct_cols = [f'P{p}' for p in RECOMMENDED_PERCENTILES]
-    split_cols = ['split_point', 'gap', 'separation_quality',
+    split_cols = ['is_bimodal', 'split_point', 'gap', 'separation_quality',
                   'band1_n', 'band1_pct', 'band1_mean', 'band1_std',
                   'band1_min', 'band1_max', 'band1_cv',
                   'band2_n', 'band2_pct', 'band2_mean', 'band2_std',
