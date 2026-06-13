@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import json
+from version import __version__
 import sys
 import statistics
 from collections import defaultdict
@@ -273,6 +274,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Statistical analysis of per-container time-series JSON files"
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "files", nargs="+", metavar="file.json",
         help="one or more metric JSON files with {timestamp, labels, value} records"

@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import csv
+from version import __version__
 import json
 import os
 import statistics
@@ -283,6 +284,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze podLatencyMeasurement JSON files and output report + CSV"
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument('--csv-only', action='store_true',
                         help='CSV output only, no report')
     parser.add_argument('files', nargs='+', metavar='file.json',

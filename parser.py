@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from version import __version__
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
@@ -1701,6 +1702,7 @@ def main():
                "%(prog)s UUID metrics FILE ...  — metrics analysis (order of args is irrelevant). "
                "Examples: '%(prog)s UUID' or '%(prog)s UUID metrics containerCPU cgroupCPU'",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--no-visuals", action="store_true",
                         help="Disable the large terminal plots (scatterplot, histogram, CDF) to save space.")
     parser.add_argument("--metric-name", "-m", default=None, help="Display name for metric (metrics mode only; e.g. cgroupCPU).")
