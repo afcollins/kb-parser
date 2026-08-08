@@ -144,15 +144,22 @@ def analyze_field(vals_sorted, field_name):
     return result
 
 
+def _open_input(filepath):
+    """Return (data, display_name) from a file path or '-' for stdin."""
+    if filepath == '-':
+        return json.load(sys.stdin), '<stdin>'
+    with open(filepath) as f:
+        return json.load(f), filepath
+
+
 def analyze_file(filepath):
     """Analyze one podLatencyMeasurement JSON file. Returns (metadata, list of field results)."""
-    with open(filepath) as f:
-        data = json.load(f)
+    data, display_name = _open_input(filepath)
 
     # Extract run metadata from first record
     first = data[0]
     metadata = {
-        'file': os.path.basename(filepath),
+        'file': display_name,
         'filepath': filepath,
         'uuid': first.get('uuid', ''),
         'jobName': first.get('jobName', ''),
@@ -298,8 +305,11 @@ def main():
         if not args.csv_only:
             print_report(metadata, field_results)
 
-    # Write CSV next to the first input file
-    first_dir = os.path.dirname(os.path.abspath(args.files[0]))
+    # Write CSV next to the first input file, or cwd for stdin
+    if args.files[0] == '-':
+        first_dir = os.getcwd()
+    else:
+        first_dir = os.path.dirname(os.path.abspath(args.files[0]))
     csv_path = os.path.join(first_dir, 'podLatency-percentile-bands.csv')
     write_csv(all_results, csv_path)
 

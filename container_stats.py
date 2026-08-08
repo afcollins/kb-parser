@@ -107,13 +107,19 @@ def get_min_mean_threshold(metric_type):
     return 0.01
 
 
-def analyze_file(filepath):
-    print(f"\n{'#'*110}")
-    print(f"# Analyzing: {filepath}")
-    print(f"{'#'*110}")
-
+def _open_input(filepath):
+    """Return (data, display_name) from a file path or '-' for stdin."""
+    if filepath == '-':
+        return json.load(sys.stdin), '<stdin>'
     with open(filepath) as f:
-        data = json.load(f)
+        return json.load(f), filepath
+
+
+def analyze_file(filepath):
+    data, display_name = _open_input(filepath)
+    print(f"\n{'#'*110}")
+    print(f"# Analyzing: {display_name}")
+    print(f"{'#'*110}")
 
     metric_type = detect_metric_type(data)
     unit = "bytes" if metric_type == 'memory' else "cores"
