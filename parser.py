@@ -254,6 +254,7 @@ def match_label_filters(entry, label_filters):
 # In-process cache: avoids re-reading the same msgpack file multiple times per run.
 # Key: cache_path → value: (source_mtime_threshold, data_dict)
 _mem_cache = {}
+_query_cache = False  # set by --query-cache; enables writing per-query subset cache files
 
 def _open_file(path):
     """Open a file for binary reading, transparently handling .gz compression."""
@@ -290,7 +291,7 @@ def _load_cache(cache_path, source_mtime):
     Checks _mem_cache first to avoid re-reading the file within the same run.
     Tries cache_path first; if msgpack path not found, falls back to the
     equivalent .kbcache.json for transparent upgrade of old caches."""
-    logging.info(f"_load_cache : {cache_path}")
+    logging.debug(f"_load_cache : {cache_path}")
     # In-memory hit: same file, still valid for this source_mtime.
     mem = _mem_cache.get(cache_path)
     if mem is not None and mem[0] >= source_mtime:
@@ -384,7 +385,8 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
     source_mtime = os.path.getmtime(filepath)
 
     _t0 = time.perf_counter()
-    cached = _load_cache(cache_path, source_mtime)
+    cached = (_load_cache(cache_path, source_mtime) if (_query_cache or not label_filters)
+              else None)
     if cached is not None:
         logging.debug("cache is not None")
         _elapsed = time.perf_counter() - _t0
@@ -457,14 +459,15 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
                 for k, v in lab.items():
                     key_counters[k][v] += 1
             logging.debug("keys counted")
-            _save_cache(cache_path, {
-                "t0_raw": bc_t0_raw,
-                "values": values,
-                "timestamps": timestamps,
-                "cardinality": {"None-None-None-None":
-                                {k: dict(v) for k, v in key_counters.items()}},
-            })
-            logging.info(f"filtered from base cache in {_elapsed:.1f}s")
+            if _query_cache:
+                _save_cache(cache_path, {
+                    "t0_raw": bc_t0_raw,
+                    "values": values,
+                    "timestamps": timestamps,
+                    "cardinality": {"None-None-None-None":
+                                    {k: dict(v) for k, v in key_counters.items()}},
+                })
+            logging.debug(f"filtered from base cache in {_elapsed:.1f}s")
             if not return_entries:
                 return values
             if need_labels:
@@ -530,8 +533,9 @@ def load_generic_metrics(filepath, label_filters=None, return_entries=False, nee
         _save_cache(cache_path, {"t0_raw": t0_raw, "values": values, "timestamps": timestamps,
                                  "labels": labels_list, "cardinality": cardinality_cache})
     else:
-        _save_cache(cache_path, {"t0_raw": t0_raw, "values": values, "timestamps": timestamps,
-                                 "cardinality": cardinality_cache})
+        if _query_cache:
+            _save_cache(cache_path, {"t0_raw": t0_raw, "values": values, "timestamps": timestamps,
+                                     "cardinality": cardinality_cache})
     if return_entries and need_labels:
         # elapsedTime was not known during the loop; stamp it now.
         for e in entries:
@@ -571,11 +575,6 @@ def _load_lat_metrics_normalized(lat_path, latency_key, field_filters=None,
 
     # Convert field_filters to label-filter format: {k: str(v)}
     effective_lf = {k: str(v) for k, v in field_filters.items()} if field_filters else None
-
-    has_filters = (effective_lf or min_val is not None or max_val is not None
-                   or tmin_sec is not None or tmax_sec is not None)
-    subset_path = (_metrics_cache_path(lat_path, effective_lf, latency_key=latency_key)
-                   if has_filters else None)
 
     # --- Base cache warm path ---
     base_cached = _load_cache(cache_path, source_mtime)
@@ -1352,7 +1351,9 @@ def _discover_group_values(filepath, group_key, label_filters=None, top_n=10):
     """Return list of (group_value, count) for group_key, sorted by count descending."""
     cache_path = _metrics_cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
-    cached = _load_cache(cache_path, source_mtime)
+    _card_path = (cache_path if (_query_cache or not label_filters)
+                  else _metrics_cache_path(filepath))
+    cached = _load_cache(_card_path, source_mtime)
     if cached:
         card = cached.get("cardinality", {}).get("None-None-None-None", {})
         counts = card.get(group_key, {})
@@ -1483,11 +1484,11 @@ def _load_metrics_data(filepath, cfg, label_filters=None,
 
     cache_path = _metrics_cache_path(filepath, label_filters)
     source_mtime = os.path.getmtime(filepath)
-    logging.info(f"_metrics_cache_path: {cache_path}")
+    logging.debug(f"_metrics_cache_path: {cache_path}")
 
     range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
     cached_card = None
-    if cfg.source:
+    if cfg.source and (_query_cache or not label_filters):
         cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
 
     need_labels = (cfg.source and cached_card is None) or bool(cfg.group_by)
@@ -1496,7 +1497,7 @@ def _load_metrics_data(filepath, cfg, label_filters=None,
 
     entries = None
     if need_entries:
-        logging.info("need_entries path")
+        logging.debug("need_entries path")
         entries = load_generic_metrics(filepath, label_filters=label_filters,
                                         return_entries=True, need_labels=need_labels)
         if tmin_sec is not None or tmax_sec is not None:
@@ -1531,7 +1532,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
     if not os.path.isfile(filepath):
         print(f"[!] Not a file: {filepath}", file=sys.stderr)
         return
-    logging.info("run_generic_metrics_analysis")
+    logging.debug("run_generic_metrics_analysis")
     entries, values, values_presorted = _load_metrics_data(
         filepath, cfg, label_filters=label_filters,
         min_val=min_val, max_val=max_val,
@@ -1563,7 +1564,8 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
 
     _t0 = time.perf_counter()
     _expected_keys = {"avg", "stdev", "cv", "p50", "p90", "p99"}
-    cached_stats = _get_cached_stats(cache_path, source_mtime)
+    cached_stats = (_get_cached_stats(cache_path, source_mtime) if (_query_cache or not label_filters)
+                    else None)
     logging.debug(f"  (stats cache lookup in {time.perf_counter()-_t0:.2f}s)")
     if cached_stats and _expected_keys <= cached_stats.keys():
         avg   = cached_stats["avg"]
@@ -1579,15 +1581,18 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
         _t0 = time.perf_counter()
         with _spinner(desc="  Computing stats", show_timer=True):
             _s = _compute_stats(sorted_vals)
-        _info(f"  (crunched numbers in {time.perf_counter()-_t0:.1f}s)")
+        _elapsed = time.perf_counter() - _t0
+        if _elapsed > 0.5:
+            _info(f"  (crunched numbers in {_elapsed:.1f}s)")
         avg, stdev, cv, p50, p90, p99 = (_s["avg"], _s["stdev"], _s["cv"],
                                             _s["p50"], _s["p90"], _s["p99"])
-        _t0 = time.perf_counter()
-        _save_stats_to_cache(cache_path, source_mtime, "values", values,
-                                {"avg": avg, "stdev": stdev, "cv": cv,
-                                "p50": p50, "p90": p90, "p99": p99,
-                                "min": _s["min"], "max": _s["max"]})
-        logging.debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
+        if _query_cache or not label_filters:
+            _t0 = time.perf_counter()
+            _save_stats_to_cache(cache_path, source_mtime, "values", values,
+                                    {"avg": avg, "stdev": stdev, "cv": cv,
+                                    "p50": p50, "p90": p90, "p99": p99,
+                                    "min": _s["min"], "max": _s["max"]})
+            logging.debug(f"  (stats cache written in {time.perf_counter()-_t0:.2f}s)")
 
     # If a value range filter is active, recompute display stats on the visible subset.
     # Cache always stores full-dataset stats; these are display-only overrides.
@@ -1613,13 +1618,15 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
 
     if cfg.source:
         range_key = f"{min_val}-{max_val}-{tmin_sec}-{tmax_sec}"
-        cached_card = (_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
+        cached_card = ((_load_cache(cache_path, source_mtime) or {}).get("cardinality", {}).get(range_key)
+                       if (_query_cache or not label_filters) else None)
         if cached_card:
             logging.info("  (cardinality cache loaded)")
             _print_cardinality(cached_card, top_n=cfg.top_labels)
         elif entries is not None:
             card = analyze_label_cardinality(clip_entries_to_range(entries, min_val, max_val), top_n=cfg.top_labels)
-            _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
+            if _query_cache or not label_filters:
+                _merge_cardinality_to_cache(cache_path, source_mtime, range_key, card)
 
     if cfg.group_by:
         grp_entries = entries or []
@@ -1665,7 +1672,7 @@ def run_generic_metrics_analysis(filepath, cfg, metric_name=None, label_filters=
                 logging.info(f"  (built graphs in {_elapsed:.1f}s)")
     elif cfg.no_visuals:
         logging.info("  (Use without --no-visuals to see histogram and CDF; add --scatter for scatter plot.)")
-    logging.info("  (analysis complete)")
+    logging.debug("  (analysis complete)")
 
 
 def _classify_cv(cv):
@@ -1745,6 +1752,9 @@ def main():
     parser.add_argument("--group-by", "-g", default=None, metavar="KEY",
                         help="Split metric entries by label key and show per-group statistics. "
                              "Use --top-labels N to control how many groups are shown (default 10).")
+    parser.add_argument("--query-cache", action="store_true",
+                        help="Enable per-query cache files (e.g. for -l / -b / -t). "
+                             "By default only the base cache is read/written.")
     parser.add_argument("--no-hist", action="store_true",
                         help="Suppress the frequency histogram plot.")
     parser.add_argument("--no-cdf", action="store_true",
@@ -1759,6 +1769,8 @@ def main():
                              "'2178a534 metrics containerCPU'.")
 
     args = parser.parse_args()
+    global _query_cache
+    _query_cache = args.query_cache
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
         _verbose = args.verbose
