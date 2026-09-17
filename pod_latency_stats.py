@@ -15,6 +15,7 @@ import csv
 from version import __version__
 import json
 import os
+from pathlib import Path
 import statistics
 import sys
 from collections import defaultdict
@@ -25,6 +26,7 @@ LATENCY_FIELDS = [
 ]
 
 RECOMMENDED_PERCENTILES = [1, 2, 5, 10, 20, 25, 33, 50, 51, 65, 68, 69, 75, 80, 88, 90, 95, 98, 99]
+ALL_PERCENTILES = range(101)
 
 
 def compute_percentile(sorted_vals, p):
@@ -75,6 +77,12 @@ def analyze_field(vals_sorted, field_name):
         'unique_values': len(set(vals_sorted)),
     }
     result['cv'] = (result['std'] / result['mean'] * 100) if result['mean'] > 0 else 0
+
+    # Keep the complete percentile series for the per-input matrix export.
+    # The established detailed CSV continues to contain its selected percentiles.
+    result['_percentiles_0_100'] = {
+        p: compute_percentile(vals_sorted, p) for p in ALL_PERCENTILES
+    }
 
     for p in RECOMMENDED_PERCENTILES:
         result[f'P{p}'] = compute_percentile(vals_sorted, p)
@@ -177,6 +185,22 @@ def analyze_file(filepath):
         field_results.append(result)
 
     return metadata, field_results
+
+
+class _Tee:
+    """Write output to both stdout and an open report file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 def print_report(metadata, field_results):
@@ -287,6 +311,48 @@ def write_csv(all_results, csv_path):
     print(f"\nCSV written to: {csv_path}")
 
 
+def write_summary_matrix(field_results, csv_path):
+    """Write one summary row per latency field for easy filtering and joins."""
+    columns = [
+        'latency_type', 'n', 'mean_ms', 'std_ms', 'cv_percent',
+        'min_ms', 'max_ms', 'unique_values',
+    ]
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for r in field_results:
+            writer.writerow({
+                'latency_type': r['field'], 'n': r['n'],
+                'mean_ms': r['mean'], 'std_ms': r['std'],
+                'cv_percent': r['cv'], 'min_ms': r['min'],
+                'max_ms': r['max'], 'unique_values': r['unique_values'],
+            })
+
+
+def write_percentile_matrix(field_results, csv_path):
+    """Write P0-P100 rows with latency fields as columns, in milliseconds."""
+    fields = [r['field'] for r in field_results]
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['percentile', 'unit', *fields])
+        for p in ALL_PERCENTILES:
+            writer.writerow([
+                f'P{p}', 'milliseconds',
+                *(r['_percentiles_0_100'][p] for r in field_results),
+            ])
+
+
+def write_report(metadata, field_results, report_path):
+    """Print a report and persist the same text to ``report_path``."""
+    original_stdout = sys.stdout
+    with open(report_path, 'w', encoding='utf-8') as report_file:
+        sys.stdout = _Tee(original_stdout, report_file)
+        try:
+            print_report(metadata, field_results)
+        finally:
+            sys.stdout = original_stdout
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze podLatencyMeasurement JSON files and output report + CSV"
@@ -294,23 +360,54 @@ def main():
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument('--csv-only', action='store_true',
                         help='CSV output only, no report')
+    parser.add_argument('-o', '--output-dir', metavar='DIR',
+                        help='write reports and CSV exports to DIR')
     parser.add_argument('files', nargs='+', metavar='file.json',
                         help='one or more podLatencyMeasurement JSON files')
     args = parser.parse_args()
 
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     all_results = []
+    used_stems = set()
     for filepath in args.files:
         metadata, field_results = analyze_file(filepath)
         all_results.extend(field_results)
-        if not args.csv_only:
-            print_report(metadata, field_results)
+        base_stem = 'stdin' if filepath == '-' else Path(filepath).stem
+        stem = base_stem
+        suffix = 2
+        while stem in used_stems:
+            stem = f'{base_stem}-{suffix}'
+            suffix += 1
+        used_stems.add(stem)
 
-    # Write CSV next to the first input file, or cwd for stdin
-    if args.files[0] == '-':
+        if output_dir:
+            summary_path = output_dir / f'{stem}-latency-summary.csv'
+            percentiles_path = output_dir / f'{stem}-latency-percentiles.csv'
+            write_summary_matrix(field_results, summary_path)
+            write_percentile_matrix(field_results, percentiles_path)
+            if not args.csv_only:
+                report_path = output_dir / f'{stem}-report.txt'
+                write_report(metadata, field_results, report_path)
+                print(f'Wrote report: {report_path}')
+            print(f'Wrote summary CSV: {summary_path}')
+            print(f'Wrote percentile CSV: {percentiles_path}')
+        if not args.csv_only:
+            if not output_dir:
+                print_report(metadata, field_results)
+
+    # Preserve the established detailed, cross-run CSV; when exporting, keep it
+    # with the other generated artifacts rather than beside the source input.
+    if output_dir:
+        csv_path = output_dir / 'podLatency-percentile-bands.csv'
+    elif args.files[0] == '-':
         first_dir = os.getcwd()
+        csv_path = os.path.join(first_dir, 'podLatency-percentile-bands.csv')
     else:
         first_dir = os.path.dirname(os.path.abspath(args.files[0]))
-    csv_path = os.path.join(first_dir, 'podLatency-percentile-bands.csv')
+        csv_path = os.path.join(first_dir, 'podLatency-percentile-bands.csv')
     write_csv(all_results, csv_path)
 
 

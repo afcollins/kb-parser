@@ -106,9 +106,10 @@ Statistical analysis of per-container time-series JSON files.
 ```bash
 container-stats containerCPU.json
 container-stats containerMemory.json cgroupMemoryRSS.json
+container-stats --output-dir stats-output containerCPU.json
 
 $ container-stats -h
-usage: container-stats [-h] [--version] file.json [file.json ...]
+usage: container-stats [-h] [--version] [-o DIR] file.json [file.json ...]
 
 Statistical analysis of per-container time-series JSON files
 
@@ -118,7 +119,13 @@ positional arguments:
 options:
   -h, --help  show this help message and exit
   --version   show program's version number and exit
+  -o DIR, --output-dir DIR
+                write a .txt report and label-statistics CSV for each input to DIR
 ```
+
+When `--output-dir` is provided, each input produces a `*-report.txt` copy of
+the terminal report and a `*-label-stats.csv` file. The CSV combines the
+per-label tables using `label_key` and `label_value` columns.
 
 ## pod-latency-stats
 
@@ -127,9 +134,10 @@ Percentile band analysis of podLatencyMeasurement files.
 ```bash
 pod-latency-stats podLatencyMeasurement-workload.json
 pod-latency-stats --csv-only podLatencyMeasurement-workload.json
+pod-latency-stats --output-dir latency-output podLatencyMeasurement-workload.json
 
 $ pod-latency-stats -h
-usage: pod-latency-stats [-h] [--version] [--csv-only] file.json [file.json ...]
+usage: pod-latency-stats [-h] [--version] [--csv-only] [-o DIR] file.json [file.json ...]
 
 Analyze podLatencyMeasurement JSON files and output report + CSV
 
@@ -140,7 +148,14 @@ options:
   -h, --help  show this help message and exit
   --version   show program's version number and exit
   --csv-only  CSV output only, no report
+  -o DIR, --output-dir DIR
+                write reports and CSV exports to DIR
 ```
+
+With `--output-dir`, each input produces a `*-report.txt`, a
+`*-latency-summary.csv` (one summary-statistic row per latency type), and a
+`*-latency-percentiles.csv` (P0–P100 rows by latency type). The existing
+cross-run detailed CSV, `podLatency-percentile-bands.csv`, is written there too.
 
 ## Test
 

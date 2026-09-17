@@ -16,7 +16,9 @@ Usage:
     python3 container_stats.py nodeCPU-Workers.json nodeMemoryUtilization-Workers.json
 """
 import argparse
+import csv
 import json
+from pathlib import Path
 from version import __version__
 import sys
 import statistics
@@ -115,8 +117,56 @@ def _open_input(filepath):
         return json.load(f), filepath
 
 
-def analyze_file(filepath):
+def _validate_metric_records(data):
+    """Validate the generic {timestamp, labels, value} input format."""
+    if not isinstance(data, list):
+        raise ValueError("expected a JSON array of metric records")
+    if not data:
+        raise ValueError("input contains no metric records")
+    if not isinstance(data[0], dict) or 'value' not in data[0]:
+        if isinstance(data[0], dict) and any(
+                key.endswith('Latency') for key in data[0]):
+            raise ValueError(
+                "this is a podLatencyMeasurement file; use pod-latency-stats instead"
+            )
+        raise ValueError("expected metric records with a 'value' field")
+    if any(not isinstance(entry, dict) or 'value' not in entry for entry in data):
+        raise ValueError("every metric record must contain a 'value' field")
+
+
+class _Tee:
+    """Write terminal output to both stdout and an open report file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+CSV_COLUMNS = [
+    'label_key', 'label_value', 'n', 'mean', 'std', 'cv_percent',
+    'min', 'p25', 'median', 'p75', 'p95', 'max',
+]
+
+
+def _write_label_stats_csv(path, rows):
+    """Write all rows from the per-label-dimension display tables."""
+    with path.open('w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _analyze_file(filepath, csv_path=None):
     data, display_name = _open_input(filepath)
+    _validate_metric_records(data)
     print(f"\n{'#'*110}")
     print(f"# Analyzing: {display_name}")
     print(f"{'#'*110}")
@@ -160,6 +210,7 @@ def analyze_file(filepath):
                 groups[lk][lv].append(v)
 
     # Per-label-dimension tables
+    csv_rows = []
     for lk in label_keys:
         grp = groups[lk]
         print(f"\n{'='*120}")
@@ -173,6 +224,16 @@ def analyze_file(filepath):
                 all_stats[lv] = st
 
         sorted_by_mean = sorted(all_stats.items(), key=lambda x: x[1]['mean'], reverse=True)
+
+        # Keep the complete table data in the CSV.  Terminal output remains
+        # capped at 80 rows so large reports are still readable.
+        for lv, st in sorted_by_mean:
+            csv_rows.append({
+                'label_key': lk, 'label_value': lv, 'n': st['n'],
+                'mean': st['mean'], 'std': st['std'], 'cv_percent': st['cv'],
+                'min': st['min'], 'p25': st['p25'], 'median': st['median'],
+                'p75': st['p75'], 'p95': st['p95'], 'max': st['max'],
+            })
 
         hdr = (f"{'Label Value':<65} {'N':>5} {'Mean':>{w}} {'Std':>{w}} {'CV%':>8} "
                f"{'Min':>{w}} {'P25':>{w}} {'Median':>{w}} {'P75':>{w}} {'P95':>{w}} {'Max':>{w}}")
@@ -241,6 +302,8 @@ def analyze_file(filepath):
     anomaly_label = cluster_labels[0] if cluster_labels else (label_keys[0] if label_keys else None)
     if not anomaly_label:
         print("\nNo label dimensions found for anomaly detection.")
+        if csv_path:
+            _write_label_stats_csv(csv_path, csv_rows)
         return
 
     print(f"\n\n{'='*120}")
@@ -275,6 +338,37 @@ def analyze_file(filepath):
     for lv, st in predictable[:20]:
         print(f"  {lv:<55} CV={st['cv']:.1f}%  mean={fv(st['mean'])}  IQR={fv(st['iqr'])}")
 
+    if csv_path:
+        _write_label_stats_csv(csv_path, csv_rows)
+
+
+def analyze_file(filepath, output_dir=None, output_stem=None):
+    """Analyze one input and optionally save its report and table data.
+
+    ``output_stem`` is supplied by ``main`` to make colliding input basenames
+    unambiguous when several files are exported into one directory.
+    """
+    if output_dir is None:
+        return _analyze_file(filepath)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = output_stem or ('stdin' if filepath == '-' else Path(filepath).stem)
+    report_path = output_dir / f"{stem}-report.txt"
+    csv_path = output_dir / f"{stem}-label-stats.csv"
+
+    original_stdout = sys.stdout
+    with report_path.open('w', encoding='utf-8') as report_file:
+        sys.stdout = _Tee(original_stdout, report_file)
+        try:
+            _analyze_file(filepath, csv_path)
+        finally:
+            sys.stdout = original_stdout
+
+    print(f"Wrote report: {report_path}")
+    print(f"Wrote CSV: {csv_path}")
+    return report_path, csv_path
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -282,13 +376,28 @@ def main():
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
+        "-o", "--output-dir", metavar="DIR",
+        help="write a .txt report and label-statistics CSV for each input to DIR"
+    )
+    parser.add_argument(
         "files", nargs="+", metavar="file.json",
         help="one or more metric JSON files with {timestamp, labels, value} records"
     )
     args = parser.parse_args()
 
+    used_stems = set()
     for filepath in args.files:
-        analyze_file(filepath)
+        base_stem = 'stdin' if filepath == '-' else Path(filepath).stem
+        stem = base_stem
+        suffix = 2
+        while stem in used_stems:
+            stem = f"{base_stem}-{suffix}"
+            suffix += 1
+        used_stems.add(stem)
+        try:
+            analyze_file(filepath, args.output_dir, stem)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            parser.error(f"{filepath}: {exc}")
 
 
 if __name__ == '__main__':
