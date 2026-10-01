@@ -1,0 +1,17 @@
+[
+  {
+    "timestamp":"2024-11-06T17:07:33Z",
+    "endTimestamp":"2024-11-06T17:10:12Z",
+    "uuid":"2178a534-fce2-4d66-839b-d874c01dc630",
+    "ocpVersion":"4.17.0-test",
+    "version":"1.4.4@test",
+    "workerNodesCount":3,
+    "totalNodes":9,
+    "jobConfig":{
+      "name":"node-density",
+      "jobIterations":3,
+      "qps":20,
+      "workloadFlags":{"churnCycles":0,"churnPercent":0,"churnDuration":0}
+    }
+  }
+]

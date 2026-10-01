@@ -1,0 +1,22 @@
+[
+  {
+    "uuid":"b334187f-b4e4-4e80-ab20-63a937fa7aea",
+    "timestamp":"2026-09-14T20:41:01.97174455Z",
+    "endTimestamp":"2026-09-14T20:41:02.200648553Z",
+    "jobConfig":{"name":"bgp-setup","jobIterations":1,"churnConfig":{}},
+    "workloadFlags":{"churnCycles":"0","churnDelay":"2m0s","churnDuration":"0s","churnPercent":"10","deletionStrategy":"default"}
+  },
+  {
+    "uuid":"b334187f-b4e4-4e80-ab20-63a937fa7aea",
+    "timestamp":"2026-09-14T20:41:02.200724717Z",
+    "endTimestamp":"2026-09-14T20:42:51.957407074Z",
+    "jobConfig":{"name":"rds","jobIterations":9,"churnConfig":{"delay":120000000000,"mode":"namespaces","percent":10}}
+  },
+  {
+    "uuid":"b334187f-b4e4-4e80-ab20-63a937fa7aea",
+    "timestamp":"2026-09-14T20:42:51.958283964Z",
+    "endTimestamp":"2026-09-14T20:43:46.04333698Z",
+    "jobConfig":{"name":"garbage-collection","churnConfig":{}},
+    "workloadFlags":{"churnCycles":"0","churnDelay":"2m0s","churnDuration":"0s","churnPercent":"10","deletionStrategy":"default"}
+  }
+]

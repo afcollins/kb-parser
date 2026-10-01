@@ -21,7 +21,7 @@ uv tool install .     # installs kb-parser, container-stats, pod-latency-stats
 ## Test Commands
 
 ```bash
-make test             # runs: uv run --extra test pytest test_parser.py -v
+make test             # runs: uv run --extra test pytest -v
 
 # Direct file mode (no UUID required)
 kb-parser containerCPU.json --no-visuals

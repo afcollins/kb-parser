@@ -16,7 +16,9 @@ Usage:
     python3 container_stats.py nodeCPU-Workers.json nodeMemoryUtilization-Workers.json
 """
 import argparse
+import contextlib
 import csv
+import io
 import json
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
@@ -593,13 +595,16 @@ def _analyze_file(filepath, csv_path=None):
         _write_label_stats_csv(csv_path, csv_rows)
 
 
-def analyze_file(filepath, output_dir=None, output_stem=None):
+def analyze_file(filepath, output_dir=None, output_stem=None, quiet=False):
     """Analyze one input and optionally save its report and table data.
 
     ``output_stem`` is supplied by ``main`` to make colliding input basenames
     unambiguous when several files are exported into one directory.
     """
     if output_dir is None:
+        if quiet:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return _analyze_file(filepath)
         return _analyze_file(filepath)
 
     output_dir = Path(output_dir)
@@ -607,6 +612,11 @@ def analyze_file(filepath, output_dir=None, output_stem=None):
     stem = output_stem or ('stdin' if filepath == '-' else Path(filepath).stem)
     report_path = output_dir / f"{stem}-report.txt"
     csv_path = output_dir / f"{stem}-label-stats.csv"
+
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _analyze_file(filepath, csv_path)
+        return None, csv_path
 
     original_stdout = sys.stdout
     with report_path.open('w', encoding='utf-8') as report_file:
@@ -631,6 +641,10 @@ def main():
         help="write a .txt report and label-statistics CSV for each input to DIR"
     )
     parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="suppress the analysis report; with --output-dir, write only CSV files"
+    )
+    parser.add_argument(
         "files", nargs="+", metavar="file.json",
         help="one or more metric JSON files with {timestamp, labels, value} records"
     )
@@ -646,7 +660,7 @@ def main():
             suffix += 1
         used_stems.add(stem)
         try:
-            analyze_file(filepath, args.output_dir, stem)
+            analyze_file(filepath, args.output_dir, stem, args.quiet)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             parser.error(f"{filepath}: {exc}")
 

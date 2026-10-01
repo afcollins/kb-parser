@@ -1,0 +1,8 @@
+[
+  {"timestamp":"2024-11-06T17:07:33Z","labels":{"container":"alertmanager","namespace":"openshift-monitoring"},"value":0.13,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"},
+  {"timestamp":"2024-11-06T17:07:34Z","labels":{"container":"approver","namespace":"openshift-network-node-identity"},"value":0.02,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"},
+  {"timestamp":"2024-11-06T17:07:35Z","labels":{"container":"kube-rbac-proxy","namespace":"openshift-monitoring"},"value":0.01,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"},
+  {"timestamp":"2024-11-06T17:07:36Z","labels":{"container":"kube-rbac-proxy","namespace":"openshift-monitoring"},"value":0.002,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"},
+  {"timestamp":"2024-11-06T17:07:37Z","labels":{"container":"prometheus","namespace":"openshift-monitoring"},"value":15.57,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"},
+  {"timestamp":"2024-11-06T17:07:38Z","labels":{"container":"controller-manager","namespace":"openshift-kube-controller-manager"},"value":1.5,"metricName":"containerCPU","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density"}
+]

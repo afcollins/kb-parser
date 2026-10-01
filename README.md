@@ -107,6 +107,7 @@ Statistical analysis of per-container time-series JSON files.
 container-stats containerCPU.json
 container-stats containerMemory.json cgroupMemoryRSS.json
 container-stats --output-dir stats-output containerCPU.json
+container-stats --quiet --output-dir stats-output containerCPU.json
 
 $ container-stats -h
 usage: container-stats [-h] [--version] [-o DIR] file.json [file.json ...]
@@ -121,6 +122,7 @@ options:
   --version   show program's version number and exit
   -o DIR, --output-dir DIR
                 write a .txt report and label-statistics CSV for each input to DIR
+  -q, --quiet   suppress the analysis report; with --output-dir, write only CSV files
 ```
 
 When `--output-dir` is provided, each input produces a `*-report.txt` copy of
@@ -137,6 +139,9 @@ UUID-wide primary workload, and therefore has one value on every row for that
 UUID. The
 metadata schema is configured by `JOB_SUMMARY_CSV_FIELDS` in
 `container_stats.py`.
+
+Use `--quiet --output-dir DIR` when only the CSV output is needed; it creates
+the `*-label-stats.csv` files without terminal output or `*-report.txt` files.
 
 Each UUID/job combination also has one all-records summary row, marked with
 `label_key=__all_labels__` and `label_value=__all__`. Its statistics cover the

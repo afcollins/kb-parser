@@ -330,7 +330,7 @@ class TestCLILabelFilter:
         rc, out, err = _run_parser(CPU_JSON, "-l", "container=kube-rbac-proxy",
                                    "--no-visuals")
         assert rc == 0
-        assert "N = 210" in out
+        assert "N = 2" in out
 
 
 class TestCLINoArgs:

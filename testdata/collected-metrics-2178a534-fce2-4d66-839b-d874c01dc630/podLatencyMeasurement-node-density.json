@@ -1,0 +1,5 @@
+[
+  {"timestamp":"2024-11-06T17:07:37Z","schedulingLatency":100,"initializedLatency":200,"containersReadyLatency":2000,"podReadyLatency":2000,"metricName":"podLatencyMeasurement","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density","namespace":"node-density","podName":"node-density-1","nodeName":"worker-1"},
+  {"timestamp":"2024-11-06T17:07:42Z","schedulingLatency":300,"initializedLatency":500,"containersReadyLatency":4000,"podReadyLatency":5000,"metricName":"podLatencyMeasurement","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density","namespace":"node-density","podName":"node-density-2","nodeName":"worker-2"},
+  {"timestamp":"2024-11-06T17:07:48Z","schedulingLatency":700,"initializedLatency":900,"containersReadyLatency":7000,"podReadyLatency":8000,"metricName":"podLatencyMeasurement","uuid":"2178a534-fce2-4d66-839b-d874c01dc630","jobName":"node-density","namespace":"node-density","podName":"node-density-3","nodeName":"worker-1"}
+]

@@ -1,0 +1,4 @@
+time="2024-11-06 17:07:16" level=info msg="Starting kube-burner (1.4.4@test) with UUID 2178a534-fce2-4d66-839b-d874c01dc630"
+time="2024-11-06 17:10:12" level=info msg="Job node-density took 3m"
+time="2024-11-06 17:10:12" level=info msg="node-density: PodScheduled 99th: 700 max: 700 avg: 367"
+time="2024-11-06 17:10:12" level=info msg="node-density: ContainersReady 99th: 7000 max: 7000 avg: 4333"

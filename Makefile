@@ -5,4 +5,4 @@ install:
 	uv tool install --force .
 
 test:
-	uv run --extra test pytest test_parser.py -v
+	uv run --extra test pytest -v
