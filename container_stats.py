@@ -161,6 +161,12 @@ LABEL_STATS_COLUMNS = [
     'min', 'p25', 'median', 'p75', 'p95', 'max',
 ]
 
+# Identifies a CSV row whose statistics cover every record for one UUID/job,
+# rather than a single label dimension/value.
+ALL_LABELS_KEY = '__all_labels__'
+ALL_LABELS_VALUE = '__all__'
+ALL_JOBS_VALUE = '__all_jobs__'
+
 # Add or remove entries here to control the metadata columns emitted in every
 # label-statistics CSV row.  Each path is tried in order, which accommodates
 # jobSummary.json files from kube-burner versions that used either
@@ -246,9 +252,32 @@ def _job_summary_csv_values(summary):
     return values
 
 
-def _metric_job_names(data):
-    """Return the distinct jobName values present in metric records."""
-    return sorted({str(entry['jobName']) for entry in data if entry.get('jobName')})
+def _metric_partitions(data):
+    """Group metric records by UUID and jobName before aggregating them."""
+    partitions = defaultdict(list)
+    for entry in data:
+        key = (str(entry.get('uuid', '')), str(entry.get('jobName', '')))
+        partitions[key].append(entry)
+    return partitions
+
+
+def _append_csv_stats_row(rows, metadata, label_key, label_value, stats):
+    """Append one summary-statistics row using the shared CSV schema."""
+    rows.append({
+        **metadata,
+        'label_key': label_key,
+        'label_value': label_value,
+        'n': stats['n'],
+        'mean': stats['mean'],
+        'std': stats['std'],
+        'cv_percent': stats['cv'],
+        'min': stats['min'],
+        'p25': stats['p25'],
+        'median': stats['median'],
+        'p75': stats['p75'],
+        'p95': stats['p95'],
+        'max': stats['max'],
+    })
 
 
 def _write_label_stats_csv(path, rows):
@@ -271,6 +300,13 @@ def _analyze_data(data, display_name, csv_rows, metadata):
 
     w = fmt_val_header(metric_type)
     fv = lambda v: fmt_val(v, metric_type)
+
+    # A single all-labels row makes cross-run comparisons possible without
+    # needing to re-aggregate the per-label rows after concatenating CSVs.
+    overall_stats = compute_stats([float(entry['value']) for entry in data])
+    _append_csv_stats_row(
+        csv_rows, metadata, ALL_LABELS_KEY, ALL_LABELS_VALUE, overall_stats
+    )
 
     # Auto-detect label keys from data
     label_keys_set = set()
@@ -320,13 +356,7 @@ def _analyze_data(data, display_name, csv_rows, metadata):
         # Keep the complete table data in the CSV.  Terminal output remains
         # capped at 80 rows so large reports are still readable.
         for lv, st in sorted_by_mean:
-            csv_rows.append({
-                **metadata,
-                'label_key': lk, 'label_value': lv, 'n': st['n'],
-                'mean': st['mean'], 'std': st['std'], 'cv_percent': st['cv'],
-                'min': st['min'], 'p25': st['p25'], 'median': st['median'],
-                'p75': st['p75'], 'p95': st['p95'], 'max': st['max'],
-            })
+            _append_csv_stats_row(csv_rows, metadata, lk, lv, st)
 
         hdr = (f"{'Label Value':<65} {'N':>5} {'Mean':>{w}} {'Std':>{w}} {'CV%':>8} "
                f"{'Min':>{w}} {'P25':>{w}} {'Median':>{w}} {'P75':>{w}} {'P95':>{w}} {'Max':>{w}}")
@@ -436,17 +466,37 @@ def _analyze_file(filepath, csv_path=None):
     _validate_metric_records(data)
     job_summary = _load_job_summary(filepath)
     base_metadata = _job_summary_csv_values(job_summary)
-    job_names = _metric_job_names(data) or ['']
     csv_rows = []
+    partitions = _metric_partitions(data)
+    uuid_partitions = defaultdict(list)
 
-    for job_name in job_names:
-        job_data = [entry for entry in data
-                    if str(entry.get('jobName', '')) == job_name]
-        metadata = {**base_metadata, 'job_name': job_name}
+    for (record_uuid, job_name), job_data in sorted(partitions.items()):
+        effective_uuid = record_uuid or base_metadata['uuid']
+        uuid_partitions[effective_uuid].extend(job_data)
+        metadata = {
+            **base_metadata,
+            'uuid': effective_uuid,
+            'job_name': job_name,
+        }
         job_display_name = display_name
-        if len(job_names) > 1:
-            job_display_name = f"{display_name} [jobName={job_name or '<missing>'}]"
+        if len(partitions) > 1:
+            job_display_name = (
+                f"{display_name} [uuid={metadata['uuid'] or '<missing>'}, "
+                f"jobName={job_name or '<missing>'}]"
+            )
         _analyze_data(job_data, job_display_name, csv_rows, metadata)
+
+    # Add a UUID-wide aggregate after the individual job partitions. This lets
+    # consumers compare a whole run without re-aggregating its job rows.
+    for uuid, uuid_data in sorted(uuid_partitions.items()):
+        stats = compute_stats([float(entry['value']) for entry in uuid_data])
+        _append_csv_stats_row(
+            csv_rows,
+            {**base_metadata, 'uuid': uuid, 'job_name': ALL_JOBS_VALUE},
+            ALL_LABELS_KEY,
+            ALL_LABELS_VALUE,
+            stats,
+        )
 
     if csv_path:
         _write_label_stats_csv(csv_path, csv_rows)
