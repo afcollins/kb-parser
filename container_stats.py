@@ -177,6 +177,7 @@ JOB_SUMMARY_CSV_FIELDS = [
     ('kube_burner_version', (('version',),)),
     ('worker_nodes', (('workerNodesCount',),)),
     ('total_nodes', (('totalNodes',),)),
+    ('workload', (('jobConfig', 'name'),)),
     ('iterations', (('jobConfig', 'jobIterations'),)),
     ('start_timestamp', (('timestamp',),)),
     ('end_timestamp', (('endTimestamp',),)),
@@ -266,6 +267,31 @@ def _matching_job_summary(summaries, uuid, job_name):
     return matching_uuid[0] if len(matching_uuid) == 1 else {}
 
 
+def _uuid_workload_summary(summaries, uuid):
+    """Select the primary workload summary for a UUID-wide aggregate.
+
+    RDS is the primary workload for multi-job RDS runs.  Otherwise, a
+    two-workload run containing the cleanup job uses its non-cleanup workload.
+    Ambiguous combinations intentionally have no selected workload.
+    """
+    matching_uuid = [summary for summary in summaries
+                     if not uuid or summary.get('uuid') == uuid]
+    by_name = {
+        summary.get('jobConfig', {}).get('name'): summary
+        for summary in matching_uuid
+        if summary.get('jobConfig', {}).get('name')
+    }
+    if 'rds' in by_name:
+        return by_name['rds']
+    if len(by_name) == 1:
+        return next(iter(by_name.values()))
+    if len(by_name) == 2 and 'garbage-collection' in by_name:
+        non_cleanup = [summary for name, summary in by_name.items()
+                       if name != 'garbage-collection']
+        return non_cleanup[0] if len(non_cleanup) == 1 else {}
+    return {}
+
+
 def _shared_job_summary_csv_values(summaries, uuid):
     """Return UUID-wide metadata derived from every matching job summary."""
     matching_uuid = [summary for summary in summaries
@@ -290,6 +316,25 @@ def _shared_job_summary_csv_values(summaries, uuid):
                  if summary.get('endTimestamp')]
     shared['start_timestamp'] = min(start_times) if start_times else ''
     shared['end_timestamp'] = max(end_times) if end_times else ''
+
+    iteration_values = []
+    for summary in matching_uuid:
+        value = _get_nested_value(summary, ('jobConfig', 'jobIterations'))
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            iteration_values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if iteration_values:
+        max_iterations = max(iteration_values)
+        shared['iterations'] = (
+            int(max_iterations) if max_iterations.is_integer() else max_iterations
+        )
+
+    workload_summary = _uuid_workload_summary(summaries, uuid)
+    if workload_summary:
+        shared['workload'] = workload_summary.get('jobConfig', {}).get('name', '')
     return shared
 
 
@@ -514,10 +559,13 @@ def _analyze_file(filepath, csv_path=None):
         summary = _matching_job_summary(job_summaries, record_uuid, job_name)
         summary_metadata = _job_summary_csv_values(summary)
         effective_uuid = record_uuid or summary_metadata['uuid']
+        workload_summary = _uuid_workload_summary(job_summaries, effective_uuid)
+        workload = workload_summary.get('jobConfig', {}).get('name', '')
         uuid_partitions[effective_uuid].extend(job_data)
         metadata = {
             **summary_metadata,
             'uuid': effective_uuid,
+            'workload': workload,
             'job_name': job_name,
         }
         job_display_name = display_name
