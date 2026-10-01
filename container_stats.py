@@ -150,10 +150,94 @@ class _Tee:
             stream.flush()
 
 
-CSV_COLUMNS = [
+LABEL_STATS_COLUMNS = [
     'label_key', 'label_value', 'n', 'mean', 'std', 'cv_percent',
     'min', 'p25', 'median', 'p75', 'p95', 'max',
 ]
+
+# Add or remove entries here to control the metadata columns emitted in every
+# label-statistics CSV row.  Each path is tried in order, which accommodates
+# jobSummary.json files from kube-burner versions that used either
+# ``churnConfig`` or ``workloadFlags``.
+JOB_SUMMARY_CSV_FIELDS = [
+    ('cluster_name', (('clusterName',),)),
+    ('ocp_version', (('ocpVersion',),)),
+    ('kube_burner_version', (('version',),)),
+    ('worker_nodes', (('workerNodesCount',),)),
+    ('total_nodes', (('totalNodes',),)),
+    ('workload', (('jobConfig', 'name'),)),
+    ('iterations', (('jobConfig', 'jobIterations'),)),
+    ('start_timestamp', (('timestamp',),)),
+    ('end_timestamp', (('endTimestamp',),)),
+    ('uuid', (('uuid',),)),
+    ('churn_cycles', (
+        ('jobConfig', 'churnConfig', 'cycles'),
+        ('jobConfig', 'workloadFlags', 'churnCycles'),
+        ('jobConfig', 'churnCycles'),
+    )),
+    ('churn_percent', (
+        ('jobConfig', 'churnConfig', 'percent'),
+        ('jobConfig', 'workloadFlags', 'churnPercent'),
+        ('jobConfig', 'churnPercent'),
+    )),
+    ('churn_duration', (
+        ('jobConfig', 'churnConfig', 'duration'),
+        ('jobConfig', 'workloadFlags', 'churnDuration'),
+        ('jobConfig', 'churnDuration'),
+    )),
+    ('churn_delay', (
+        ('jobConfig', 'churnConfig', 'delay'),
+        ('jobConfig', 'workloadFlags', 'churnDelay'),
+        ('jobConfig', 'churnDelay'),
+    )),
+    ('churn_deletion_strategy', (
+        ('jobConfig', 'churnConfig', 'deletionStrategy'),
+        ('jobConfig', 'workloadFlags', 'churnDeletionStrategy'),
+        ('jobConfig', 'churnDeletionStrategy'),
+    )),
+]
+
+CSV_METADATA_COLUMNS = [name for name, _ in JOB_SUMMARY_CSV_FIELDS]
+CSV_COLUMNS = CSV_METADATA_COLUMNS + LABEL_STATS_COLUMNS
+
+
+def _get_nested_value(document, path):
+    """Return a nested value, or None when a path is not present."""
+    value = document
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def _load_job_summary(filepath):
+    """Load the optional job summary beside a metric file."""
+    if filepath == '-':
+        return {}
+    summary_path = Path(filepath).parent / 'jobSummary.json'
+    if not summary_path.exists():
+        return {}
+    with summary_path.open(encoding='utf-8') as summary_file:
+        summary = json.load(summary_file)
+    if isinstance(summary, list):
+        summary = summary[0] if summary else {}
+    if not isinstance(summary, dict):
+        raise ValueError('jobSummary.json must contain an object or a non-empty array')
+    return summary
+
+
+def _job_summary_csv_values(summary):
+    """Flatten configured job-summary paths into CSV-safe scalar values."""
+    values = {}
+    for name, paths in JOB_SUMMARY_CSV_FIELDS:
+        values[name] = ''
+        for path in paths:
+            value = _get_nested_value(summary, path)
+            if value is not None:
+                values[name] = value
+                break
+    return values
 
 
 def _write_label_stats_csv(path, rows):
@@ -167,6 +251,8 @@ def _write_label_stats_csv(path, rows):
 def _analyze_file(filepath, csv_path=None):
     data, display_name = _open_input(filepath)
     _validate_metric_records(data)
+    job_summary = _load_job_summary(filepath)
+    metadata = _job_summary_csv_values(job_summary)
     print(f"\n{'#'*110}")
     print(f"# Analyzing: {display_name}")
     print(f"{'#'*110}")
@@ -229,6 +315,7 @@ def _analyze_file(filepath, csv_path=None):
         # capped at 80 rows so large reports are still readable.
         for lv, st in sorted_by_mean:
             csv_rows.append({
+                **metadata,
                 'label_key': lk, 'label_value': lv, 'n': st['n'],
                 'mean': st['mean'], 'std': st['std'], 'cv_percent': st['cv'],
                 'min': st['min'], 'p25': st['p25'], 'median': st['median'],

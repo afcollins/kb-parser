@@ -1,7 +1,7 @@
 .PHONY: install test
 
 install:
-	uv cache clean kb-parser
+	uv cache clean --force kb-parser
 	uv tool install --force .
 
 test:

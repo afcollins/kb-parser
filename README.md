@@ -126,6 +126,11 @@ options:
 When `--output-dir` is provided, each input produces a `*-report.txt` copy of
 the terminal report and a `*-label-stats.csv` file. The CSV combines the
 per-label tables using `label_key` and `label_value` columns.
+When the input is inside a collected-metrics directory, the CSV also repeats
+run metadata from the neighboring `jobSummary.json` on every row, including
+cluster/version/node, workload, timestamps, UUID, and churn settings. The
+metadata schema is configured by `JOB_SUMMARY_CSV_FIELDS` in
+`container_stats.py`.
 
 ## pod-latency-stats
 
