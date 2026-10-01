@@ -128,9 +128,11 @@ the terminal report and a `*-label-stats.csv` file. The CSV combines the
 per-label tables using `label_key` and `label_value` columns.
 When the input is inside a collected-metrics directory, the CSV also repeats
 run metadata from the neighboring `jobSummary.json` on every row, including
-cluster/version/node, workload, timestamps, UUID, and churn settings. The
-metric record's `jobName` is also included as `job_name`, so outputs can be
-separated by workload as well as UUID. The
+cluster/version/node, timestamps, UUID, and churn settings. The metric
+record's `jobName` is included as `job_name`, so outputs can be separated by
+workload as well as UUID. When `jobSummary.json` has multiple documents, each
+job partition uses the document whose `jobConfig.name` matches its `job_name`.
+The
 metadata schema is configured by `JOB_SUMMARY_CSV_FIELDS` in
 `container_stats.py`.
 
@@ -138,7 +140,9 @@ Each UUID/job combination also has one all-records summary row, marked with
 `label_key=__all_labels__` and `label_value=__all__`. Its statistics cover the
 entire metric partition regardless of labels.
 A second UUID-wide row combines every job for that run; it is marked with both
-`job_name=__all_jobs__` and `label_value=__all_jobs__`.
+`job_name=__all_jobs__` and `label_key=__all_labels__`; its `label_value` is
+`__all__`. Job-specific metadata is left blank on that row when the job
+summaries differ.
 
 ## pod-latency-stats
 

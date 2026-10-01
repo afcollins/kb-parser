@@ -177,7 +177,6 @@ JOB_SUMMARY_CSV_FIELDS = [
     ('kube_burner_version', (('version',),)),
     ('worker_nodes', (('workerNodesCount',),)),
     ('total_nodes', (('totalNodes',),)),
-    ('workload', (('jobConfig', 'name'),)),
     ('iterations', (('jobConfig', 'jobIterations'),)),
     ('start_timestamp', (('timestamp',),)),
     ('end_timestamp', (('endTimestamp',),)),
@@ -186,26 +185,31 @@ JOB_SUMMARY_CSV_FIELDS = [
         ('jobConfig', 'churnConfig', 'cycles'),
         ('jobConfig', 'workloadFlags', 'churnCycles'),
         ('jobConfig', 'churnCycles'),
+        ('workloadFlags', 'churnCycles'),
     )),
     ('churn_percent', (
         ('jobConfig', 'churnConfig', 'percent'),
         ('jobConfig', 'workloadFlags', 'churnPercent'),
         ('jobConfig', 'churnPercent'),
+        ('workloadFlags', 'churnPercent'),
     )),
     ('churn_duration', (
         ('jobConfig', 'churnConfig', 'duration'),
         ('jobConfig', 'workloadFlags', 'churnDuration'),
         ('jobConfig', 'churnDuration'),
+        ('workloadFlags', 'churnDuration'),
     )),
     ('churn_delay', (
         ('jobConfig', 'churnConfig', 'delay'),
         ('jobConfig', 'workloadFlags', 'churnDelay'),
         ('jobConfig', 'churnDelay'),
+        ('workloadFlags', 'churnDelay'),
     )),
     ('churn_deletion_strategy', (
         ('jobConfig', 'churnConfig', 'deletionStrategy'),
         ('jobConfig', 'workloadFlags', 'churnDeletionStrategy'),
         ('jobConfig', 'churnDeletionStrategy'),
+        ('workloadFlags', 'deletionStrategy'),
     )),
 ]
 
@@ -223,20 +227,20 @@ def _get_nested_value(document, path):
     return value
 
 
-def _load_job_summary(filepath):
-    """Load the optional job summary beside a metric file."""
+def _load_job_summaries(filepath):
+    """Load optional job-summary documents beside a metric file."""
     if filepath == '-':
-        return {}
+        return []
     summary_path = Path(filepath).parent / 'jobSummary.json'
     if not summary_path.exists():
-        return {}
+        return []
     with summary_path.open(encoding='utf-8') as summary_file:
-        summary = json.load(summary_file)
-    if isinstance(summary, list):
-        summary = summary[0] if summary else {}
-    if not isinstance(summary, dict):
-        raise ValueError('jobSummary.json must contain an object or a non-empty array')
-    return summary
+        summaries = json.load(summary_file)
+    if isinstance(summaries, dict):
+        return [summaries]
+    if not isinstance(summaries, list) or any(not isinstance(item, dict) for item in summaries):
+        raise ValueError('jobSummary.json must contain an object or an array of objects')
+    return summaries
 
 
 def _job_summary_csv_values(summary):
@@ -250,6 +254,43 @@ def _job_summary_csv_values(summary):
                 values[name] = value
                 break
     return values
+
+
+def _matching_job_summary(summaries, uuid, job_name):
+    """Return the job-summary document for one metric UUID/job partition."""
+    matching_uuid = [summary for summary in summaries
+                     if not uuid or summary.get('uuid') == uuid]
+    for summary in matching_uuid:
+        if summary.get('jobConfig', {}).get('name') == job_name:
+            return summary
+    return matching_uuid[0] if len(matching_uuid) == 1 else {}
+
+
+def _shared_job_summary_csv_values(summaries, uuid):
+    """Return UUID-wide metadata derived from every matching job summary."""
+    matching_uuid = [summary for summary in summaries
+                     if not uuid or summary.get('uuid') == uuid]
+    if not matching_uuid:
+        return _job_summary_csv_values({})
+
+    values_by_summary = [_job_summary_csv_values(summary)
+                         for summary in matching_uuid]
+    shared = {}
+    for field in CSV_METADATA_COLUMNS:
+        values = {str(summary_values.get(field, ''))
+                  for summary_values in values_by_summary}
+        shared[field] = values.pop() if len(values) == 1 else ''
+
+    # ISO 8601 UTC timestamps sort chronologically as strings.  Unlike the
+    # other job-specific fields, the UUID-wide row represents the full run,
+    # so retain its earliest start and latest end.
+    start_times = [summary.get('timestamp') for summary in matching_uuid
+                   if summary.get('timestamp')]
+    end_times = [summary.get('endTimestamp') for summary in matching_uuid
+                 if summary.get('endTimestamp')]
+    shared['start_timestamp'] = min(start_times) if start_times else ''
+    shared['end_timestamp'] = max(end_times) if end_times else ''
+    return shared
 
 
 def _metric_partitions(data):
@@ -464,17 +505,18 @@ def _analyze_data(data, display_name, csv_rows, metadata):
 def _analyze_file(filepath, csv_path=None):
     data, display_name = _open_input(filepath)
     _validate_metric_records(data)
-    job_summary = _load_job_summary(filepath)
-    base_metadata = _job_summary_csv_values(job_summary)
+    job_summaries = _load_job_summaries(filepath)
     csv_rows = []
     partitions = _metric_partitions(data)
     uuid_partitions = defaultdict(list)
 
     for (record_uuid, job_name), job_data in sorted(partitions.items()):
-        effective_uuid = record_uuid or base_metadata['uuid']
+        summary = _matching_job_summary(job_summaries, record_uuid, job_name)
+        summary_metadata = _job_summary_csv_values(summary)
+        effective_uuid = record_uuid or summary_metadata['uuid']
         uuid_partitions[effective_uuid].extend(job_data)
         metadata = {
-            **base_metadata,
+            **summary_metadata,
             'uuid': effective_uuid,
             'job_name': job_name,
         }
@@ -490,9 +532,10 @@ def _analyze_file(filepath, csv_path=None):
     # consumers compare a whole run without re-aggregating its job rows.
     for uuid, uuid_data in sorted(uuid_partitions.items()):
         stats = compute_stats([float(entry['value']) for entry in uuid_data])
+        metadata = _shared_job_summary_csv_values(job_summaries, uuid)
         _append_csv_stats_row(
             csv_rows,
-            {**base_metadata, 'uuid': uuid, 'job_name': ALL_JOBS_VALUE},
+            {**metadata, 'uuid': uuid, 'job_name': ALL_JOBS_VALUE},
             ALL_LABELS_KEY,
             ALL_LABELS_VALUE,
             stats,
