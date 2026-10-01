@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from version import __version__
+from importlib.metadata import version, PackageNotFoundError
 from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stdout
 import csv
@@ -20,6 +20,12 @@ import sys
 import threading
 import time
 import logging
+
+try:
+    __version__ = version("kb-parser")
+except PackageNotFoundError:
+    # package is not installed
+    pass
 
 if sys.version_info < (3, 11):
     logging.warning(f"Python 3.11+ recommended (running {sys.version}); timestamp parsing may be unreliable")

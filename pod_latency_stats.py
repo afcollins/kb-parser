@@ -12,13 +12,19 @@ Usage:
 """
 import argparse
 import csv
-from version import __version__
+from importlib.metadata import version, PackageNotFoundError
 import json
 import os
 from pathlib import Path
 import statistics
 import sys
 from collections import defaultdict
+
+try:
+    __version__ = version("kb-parser")
+except PackageNotFoundError:
+    # package is not installed
+    pass
 
 LATENCY_FIELDS = [
     'schedulingLatency', 'initializedLatency', 'containersReadyLatency',

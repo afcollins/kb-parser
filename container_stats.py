@@ -19,10 +19,16 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from version import __version__
+from importlib.metadata import version, PackageNotFoundError
 import sys
 import statistics
 from collections import defaultdict
+
+try:
+    __version__ = version("kb-parser")
+except PackageNotFoundError:
+    # package is not installed
+    pass
 
 
 def detect_metric_type(data):
