@@ -197,7 +197,7 @@ JOB_SUMMARY_CSV_FIELDS = [
     )),
 ]
 
-CSV_METADATA_COLUMNS = [name for name, _ in JOB_SUMMARY_CSV_FIELDS]
+CSV_METADATA_COLUMNS = [name for name, _ in JOB_SUMMARY_CSV_FIELDS] + ['job_name']
 CSV_COLUMNS = CSV_METADATA_COLUMNS + LABEL_STATS_COLUMNS
 
 
@@ -240,6 +240,11 @@ def _job_summary_csv_values(summary):
     return values
 
 
+def _metric_job_names(data):
+    """Return the distinct jobName values present in metric records."""
+    return sorted({str(entry['jobName']) for entry in data if entry.get('jobName')})
+
+
 def _write_label_stats_csv(path, rows):
     """Write all rows from the per-label-dimension display tables."""
     with path.open('w', newline='', encoding='utf-8') as csv_file:
@@ -248,11 +253,7 @@ def _write_label_stats_csv(path, rows):
         writer.writerows(rows)
 
 
-def _analyze_file(filepath, csv_path=None):
-    data, display_name = _open_input(filepath)
-    _validate_metric_records(data)
-    job_summary = _load_job_summary(filepath)
-    metadata = _job_summary_csv_values(job_summary)
+def _analyze_data(data, display_name, csv_rows, metadata):
     print(f"\n{'#'*110}")
     print(f"# Analyzing: {display_name}")
     print(f"{'#'*110}")
@@ -296,7 +297,6 @@ def _analyze_file(filepath, csv_path=None):
                 groups[lk][lv].append(v)
 
     # Per-label-dimension tables
-    csv_rows = []
     for lk in label_keys:
         grp = groups[lk]
         print(f"\n{'='*120}")
@@ -389,8 +389,6 @@ def _analyze_file(filepath, csv_path=None):
     anomaly_label = cluster_labels[0] if cluster_labels else (label_keys[0] if label_keys else None)
     if not anomaly_label:
         print("\nNo label dimensions found for anomaly detection.")
-        if csv_path:
-            _write_label_stats_csv(csv_path, csv_rows)
         return
 
     print(f"\n\n{'='*120}")
@@ -424,6 +422,25 @@ def _analyze_file(filepath, csv_path=None):
     predictable.sort(key=lambda x: x[1]['cv'])
     for lv, st in predictable[:20]:
         print(f"  {lv:<55} CV={st['cv']:.1f}%  mean={fv(st['mean'])}  IQR={fv(st['iqr'])}")
+
+
+
+def _analyze_file(filepath, csv_path=None):
+    data, display_name = _open_input(filepath)
+    _validate_metric_records(data)
+    job_summary = _load_job_summary(filepath)
+    base_metadata = _job_summary_csv_values(job_summary)
+    job_names = _metric_job_names(data) or ['']
+    csv_rows = []
+
+    for job_name in job_names:
+        job_data = [entry for entry in data
+                    if str(entry.get('jobName', '')) == job_name]
+        metadata = {**base_metadata, 'job_name': job_name}
+        job_display_name = display_name
+        if len(job_names) > 1:
+            job_display_name = f"{display_name} [jobName={job_name or '<missing>'}]"
+        _analyze_data(job_data, job_display_name, csv_rows, metadata)
 
     if csv_path:
         _write_label_stats_csv(csv_path, csv_rows)

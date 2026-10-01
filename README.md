@@ -129,6 +129,8 @@ per-label tables using `label_key` and `label_value` columns.
 When the input is inside a collected-metrics directory, the CSV also repeats
 run metadata from the neighboring `jobSummary.json` on every row, including
 cluster/version/node, workload, timestamps, UUID, and churn settings. The
+metric record's `jobName` is also included as `job_name`, so outputs can be
+separated by workload as well as UUID. The
 metadata schema is configured by `JOB_SUMMARY_CSV_FIELDS` in
 `container_stats.py`.
 

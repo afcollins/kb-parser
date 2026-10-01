@@ -172,8 +172,8 @@ QUANTILES_HEADERS = [f"P{i:02d}" for i in range(5, 100, 5)]
 
 # We define the order by finding 'job_took' and inserting the percentiles right after it
 ORIGINAL_COLUMNS = [
-    "OCP Version", "k-b version", "workers", "workload", "scheduler",
-    "iterations", "podReplicas", "start time", "UUID",
+    "OCP Version", "k-b version", "workers", "workload",
+    "iterations", "start time", "UUID",
     "sched_p99", "sched_max", "sched_avg", "sched_stddev",
     "ready_p99", "ready_max", "ready_avg",
     "end time", "percent", "duration", "cycles", "job_took",
@@ -1162,7 +1162,7 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                     'Note': summary_data.get('workloadMods', DEFAULT_VAL),
                     'scheduler': summary_data.get('scheduler', DEFAULT_VAL),
                     'podReplicas': summary_data.get('podReplicas', DEFAULT_VAL),
-                    'workers': summary_data.get('otherNodesCount', 0),
+                    'workers': summary_data.get('workerNodesCount', 0),
                     'worker reserved cores': summary_data.get('workerReservedCores', DEFAULT_VAL),
                     'worker CPUs': summary_data.get('workerCPUs', DEFAULT_VAL),
                     'topologyPolicy': summary_data.get('topologyPolicy', DEFAULT_VAL)
@@ -1171,11 +1171,11 @@ def process_automation(uuid_fragments, cfg, min_val=None, max_val=None,
                 data['workload'] = job_cfg.get('name', DEFAULT_VAL)
                 data['iterations'] = job_cfg.get('jobIterations', 0)
                 data['qps burst'] = job_cfg.get('qps', DEFAULT_VAL)
-                churn = job_cfg.get('churnConfig', {})
+                churn = job_cfg.get('workloadFlags', {})
                 data.update({
-                    'cycles': churn.get('cycles', DEFAULT_VAL),
-                    'percent': churn.get('percent', DEFAULT_VAL),
-                    'duration': f"{int(churn.get('duration', 0) / 60_000_000_000)}m"
+                    'cycles': churn.get('churnCycles', DEFAULT_VAL),
+                    'percent': churn.get('churnPercent', DEFAULT_VAL),
+                    'duration': f"{int(churn.get('churnDuration', 0) / 60_000_000_000)}m"
                 })
         except Exception as e: print(f"  [!] Summary JSON Error: {e}")
 
