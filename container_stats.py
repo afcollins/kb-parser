@@ -654,9 +654,10 @@ def analyze_file(filepath, output_dir=None, output_stem=None, quiet=False):
     csv_path = output_dir / f"{stem}-label-stats.csv"
 
     if quiet:
-        with contextlib.redirect_stdout(io.StringIO()):
-            _analyze_file(filepath, csv_path)
-        return None, csv_path
+        with report_path.open('w', encoding='utf-8') as report_file:
+            with contextlib.redirect_stdout(report_file):
+                _analyze_file(filepath, csv_path)
+        return report_path, csv_path
 
     original_stdout = sys.stdout
     with report_path.open('w', encoding='utf-8') as report_file:
@@ -682,7 +683,7 @@ def main():
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true",
-        help="suppress the analysis report; with --output-dir, write only CSV files"
+        help="suppress terminal output; with --output-dir, save the report and CSV files"
     )
     parser.add_argument(
         "files", nargs="+", metavar="file.json",

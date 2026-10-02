@@ -122,7 +122,7 @@ options:
   --version   show program's version number and exit
   -o DIR, --output-dir DIR
                 write a .txt report and label-statistics CSV for each input to DIR
-  -q, --quiet   suppress the analysis report; with --output-dir, write only CSV files
+  -q, --quiet   suppress terminal output; with --output-dir, save the report and CSV files
 ```
 
 When `--output-dir` is provided, each input produces a `*-report.txt` copy of
@@ -140,8 +140,8 @@ one value on every row for that UUID. The
 metadata schema is configured by `JOB_SUMMARY_CSV_FIELDS` in
 `container_stats.py`.
 
-Use `--quiet --output-dir DIR` when only the CSV output is needed; it creates
-the `*-label-stats.csv` files without terminal output or `*-report.txt` files.
+Use `--quiet --output-dir DIR` to write the normal report and CSV files without
+printing the report or completion messages to the terminal.
 
 ## metric-delta
 

@@ -177,11 +177,13 @@ class TestUuidWideAggregation:
         assert values['churn_delay'] == '15s'
         assert values['churn_deletion_strategy'] == 'default'
 
-    def test_quiet_output_dir_writes_only_csv(self, tmp_path, capsys):
+    def test_quiet_output_dir_writes_report_and_csv_without_stdout(self, tmp_path, capsys):
         CS.analyze_file(MULTI_JOB_METRIC, tmp_path, quiet=True)
 
         assert (tmp_path / 'kubeletCPU-label-stats.csv').is_file()
-        assert not (tmp_path / 'kubeletCPU-report.txt').exists()
+        report_path = tmp_path / 'kubeletCPU-report.txt'
+        assert report_path.is_file()
+        assert report_path.read_text(encoding='utf-8')
         assert capsys.readouterr().out == ''
 
     def test_rds_is_the_uuid_workload_for_every_row(self, tmp_path):
