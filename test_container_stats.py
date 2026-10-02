@@ -3,18 +3,105 @@
 import contextlib
 import csv
 import io
+import json
+import statistics
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import container_stats as CS
+import metric_delta as MD
 
 
 TESTDATA_DIR = Path(__file__).parent / 'testdata'
 MULTI_JOB_DIR = TESTDATA_DIR / 'collected-metrics-b334187f-b4e4-4e80-ab20-63a937fa7aea'
 MULTI_JOB_METRIC = MULTI_JOB_DIR / 'kubeletCPU.json'
 MULTI_JOB_UUID = 'b334187f-b4e4-4e80-ab20-63a937fa7aea'
+CGROUP_START = MULTI_JOB_DIR / 'cgroupCPUSeconds-Workers-start.json'
+CGROUP_FINAL = MULTI_JOB_DIR / 'cgroupCPUSeconds-Workers.json'
 
 
 class TestUuidWideAggregation:
+    def test_start_and_final_files_create_deduplicated_deltas(self, tmp_path):
+        start_data = json.loads(CGROUP_START.read_text())
+        final_data = json.loads(CGROUP_FINAL.read_text())
+
+        deltas = MD.build_delta_records(start_data, final_data)
+
+        assert len(deltas) == 15  # 3 jobs x 5 cgroup labels; replicas are averaged.
+        rds_pods = next(
+            entry for entry in deltas
+            if entry['jobName'] == 'rds'
+            and entry['labels']['id'] == '/kubepods.slice'
+        )
+        key = MD._snapshot_key(rds_pods)
+        expected = (
+            statistics.mean(float(entry['value']) for entry in final_data
+                            if MD._snapshot_key(entry) == key)
+            - statistics.mean(float(entry['value']) for entry in start_data
+                              if MD._snapshot_key(entry) == key)
+        )
+        assert rds_pods['value'] == expected
+        assert rds_pods['metricName'] == 'cgroupCPUSeconds-Workers-delta'
+
+        csv_path = MD.write_delta_csv(CGROUP_START, tmp_path)
+        assert csv_path.name == 'cgroupCPUSeconds-Workers.csv'
+        with csv_path.open(newline='') as csv_file:
+            rows = list(csv.DictReader(csv_file))
+        assert {row['metric_name'] for row in rows} == {
+            'cgroupCPUSeconds-Workers-delta'
+        }
+        assert 'mean' not in rows[0]
+        assert 'delta' in rows[0]
+        raw_rds = [row for row in rows if row['job_name'] == 'rds'
+                   and row['label_key'] != CS.ALL_LABELS_KEY]
+        rds_total = next(row for row in rows if row['job_name'] == 'rds'
+                         and row['label_key'] == CS.ALL_LABELS_KEY
+                         and row['label_value'] == CS.ALL_LABELS_VALUE)
+        uuid_total = next(row for row in rows
+                          if row['job_name'] == CS.ALL_JOBS_VALUE
+                          and row['label_key'] == CS.ALL_LABELS_KEY)
+        uuid_pods = next(row for row in rows
+                         if row['job_name'] == CS.ALL_JOBS_VALUE
+                         and row['label_key'] == 'id'
+                         and row['label_value'] == '/kubepods.slice')
+        assert len(raw_rds) == 5
+        assert float(rds_total['delta']) == sum(float(row['delta']) for row in raw_rds)
+        assert uuid_total['label_key'] == CS.ALL_LABELS_KEY
+        assert uuid_total['label_value'] == CS.ALL_LABELS_VALUE
+        assert float(uuid_pods['delta']) == sum(
+            float(row['delta']) for row in rows
+            if row['job_name'] != CS.ALL_JOBS_VALUE
+            and row['label_key'] == 'id'
+            and row['label_value'] == '/kubepods.slice'
+        )
+        assert float(uuid_total['delta']) == sum(
+            float(row['delta']) for row in rows
+            if row['job_name'] != CS.ALL_JOBS_VALUE
+            and row['label_key'] != CS.ALL_LABELS_KEY
+        )
+
+    def test_start_file_cli_finds_final_file(self, tmp_path, capsys):
+        with patch.object(sys, 'argv', [
+            'metric-delta', '--quiet', '--output-dir', str(tmp_path),
+            str(CGROUP_START),
+        ]):
+            MD.main()
+
+        assert (tmp_path / 'cgroupCPUSeconds-Workers.csv').is_file()
+        assert capsys.readouterr().out == ''
+
+    def test_container_stats_still_analyzes_start_file_normally(self, tmp_path, capsys):
+        with patch.object(sys, 'argv', [
+            'container-stats', '--quiet', '--output-dir', str(tmp_path),
+            str(CGROUP_START),
+        ]):
+            CS.main()
+
+        assert (tmp_path / 'cgroupCPUSeconds-Workers-start-label-stats.csv').is_file()
+        assert not (tmp_path / 'cgroupCPUSeconds-Workers.csv').exists()
+        assert capsys.readouterr().out == ''
+
     def test_metric_name_partitions_are_not_merged(self):
         records = [
             {'uuid': 'run-1', 'metricName': 'containerCPU', 'jobName': 'rds'},
@@ -125,6 +212,14 @@ class TestUuidWideAggregation:
         assert overall_rows[CS.ALL_JOBS_VALUE]['n'] == '6'
         assert overall_rows[CS.ALL_JOBS_VALUE]['workload'] == 'rds'
         assert overall_rows[CS.ALL_JOBS_VALUE]['iterations'] == '9'
+
+        all_jobs_node = next(
+            row for row in rows
+            if row['job_name'] == CS.ALL_JOBS_VALUE
+            and row['label_key'] == 'node'
+            and row['label_value'] == 'cc37-h27-000-r750'
+        )
+        assert all_jobs_node['n'] == '3'
 
     def test_non_cleanup_workload_is_selected_for_two_job_run(self):
         summaries = [

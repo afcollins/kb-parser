@@ -555,13 +555,12 @@ def _analyze_data(data, display_name, csv_rows, metadata):
 
 
 
-def _analyze_file(filepath, csv_path=None):
-    data, display_name = _open_input(filepath)
-    _validate_metric_records(data)
+def _analyze_records(filepath, data, display_name, csv_path=None):
     job_summaries = _load_job_summaries(filepath)
     csv_rows = []
     partitions = _metric_partitions(data)
     uuid_partitions = defaultdict(list)
+    uuid_label_values = defaultdict(list)
 
     for (record_uuid, metric_name, job_name), job_data in sorted(partitions.items()):
         summary = _matching_job_summary(job_summaries, record_uuid, job_name)
@@ -570,6 +569,11 @@ def _analyze_file(filepath, csv_path=None):
         workload_summary = _uuid_workload_summary(job_summaries, effective_uuid)
         workload = workload_summary.get('jobConfig', {}).get('name', '')
         uuid_partitions[(effective_uuid, metric_name)].extend(job_data)
+        for entry in job_data:
+            for label_key, label_value in entry.get('labels', {}).items():
+                uuid_label_values[(effective_uuid, metric_name, label_key, label_value)].append(
+                    float(entry['value'])
+                )
         metadata = {
             **summary_metadata,
             'uuid': effective_uuid,
@@ -585,6 +589,23 @@ def _analyze_file(filepath, csv_path=None):
                 f"jobName={job_name or '<missing>'}]"
             )
         _analyze_data(job_data, job_display_name, csv_rows, metadata)
+
+    # Add per-label UUID-wide statistics, combining each label value across
+    # every job in the run.
+    for (uuid, metric_name, label_key, label_value), values in sorted(uuid_label_values.items()):
+        metadata = _shared_job_summary_csv_values(job_summaries, uuid)
+        _append_csv_stats_row(
+            csv_rows,
+            {
+                **metadata,
+                'uuid': uuid,
+                'metric_name': metric_name,
+                'job_name': ALL_JOBS_VALUE,
+            },
+            label_key,
+            label_value,
+            compute_stats(values),
+        )
 
     # Add a UUID-wide aggregate after the individual job partitions. This lets
     # consumers compare a whole run without re-aggregating its job rows.
@@ -606,6 +627,12 @@ def _analyze_file(filepath, csv_path=None):
 
     if csv_path:
         _write_label_stats_csv(csv_path, csv_rows)
+
+
+def _analyze_file(filepath, csv_path=None):
+    data, display_name = _open_input(filepath)
+    _validate_metric_records(data)
+    _analyze_records(filepath, data, display_name, csv_path)
 
 
 def analyze_file(filepath, output_dir=None, output_stem=None, quiet=False):
@@ -665,7 +692,8 @@ def main():
 
     used_stems = set()
     for filepath in args.files:
-        base_stem = 'stdin' if filepath == '-' else Path(filepath).stem
+        path = Path(filepath)
+        base_stem = 'stdin' if filepath == '-' else path.stem
         stem = base_stem
         suffix = 2
         while stem in used_stems:

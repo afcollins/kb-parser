@@ -20,9 +20,10 @@ dependencies = [
 test = ["pytest"]
 
 [tool.setuptools]
-py-modules = ["parser", "container_stats", "pod_latency_stats", "version"]
+py-modules = ["parser", "container_stats", "metric_delta", "pod_latency_stats", "version"]
 
 [project.scripts]
 kb-parser = "parser:main"
 container-stats = "container_stats:main"
+metric-delta = "metric_delta:main"
 pod-latency-stats = "pod_latency_stats:main"
