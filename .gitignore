@@ -1,3 +1,7 @@
 *.kbcache.msgpack
 *.png
 __pycache__
+kb_parser.egg-info
+build/
+.DS_Store
+.serena/

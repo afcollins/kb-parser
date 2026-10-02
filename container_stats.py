@@ -216,7 +216,9 @@ JOB_SUMMARY_CSV_FIELDS = [
     )),
 ]
 
-CSV_METADATA_COLUMNS = [name for name, _ in JOB_SUMMARY_CSV_FIELDS] + ['job_name']
+CSV_METADATA_COLUMNS = [name for name, _ in JOB_SUMMARY_CSV_FIELDS] + [
+    'metric_name', 'job_name',
+]
 CSV_COLUMNS = CSV_METADATA_COLUMNS + LABEL_STATS_COLUMNS
 
 
@@ -341,10 +343,14 @@ def _shared_job_summary_csv_values(summaries, uuid):
 
 
 def _metric_partitions(data):
-    """Group metric records by UUID and jobName before aggregating them."""
+    """Group metric records by UUID, metricName, and jobName before aggregating."""
     partitions = defaultdict(list)
     for entry in data:
-        key = (str(entry.get('uuid', '')), str(entry.get('jobName', '')))
+        key = (
+            str(entry.get('uuid', '')),
+            str(entry.get('metricName', '')),
+            str(entry.get('jobName', '')),
+        )
         partitions[key].append(entry)
     return partitions
 
@@ -557,35 +563,42 @@ def _analyze_file(filepath, csv_path=None):
     partitions = _metric_partitions(data)
     uuid_partitions = defaultdict(list)
 
-    for (record_uuid, job_name), job_data in sorted(partitions.items()):
+    for (record_uuid, metric_name, job_name), job_data in sorted(partitions.items()):
         summary = _matching_job_summary(job_summaries, record_uuid, job_name)
         summary_metadata = _job_summary_csv_values(summary)
         effective_uuid = record_uuid or summary_metadata['uuid']
         workload_summary = _uuid_workload_summary(job_summaries, effective_uuid)
         workload = workload_summary.get('jobConfig', {}).get('name', '')
-        uuid_partitions[effective_uuid].extend(job_data)
+        uuid_partitions[(effective_uuid, metric_name)].extend(job_data)
         metadata = {
             **summary_metadata,
             'uuid': effective_uuid,
             'workload': workload,
+            'metric_name': metric_name,
             'job_name': job_name,
         }
         job_display_name = display_name
         if len(partitions) > 1:
             job_display_name = (
                 f"{display_name} [uuid={metadata['uuid'] or '<missing>'}, "
+                f"metricName={metric_name or '<missing>'}, "
                 f"jobName={job_name or '<missing>'}]"
             )
         _analyze_data(job_data, job_display_name, csv_rows, metadata)
 
     # Add a UUID-wide aggregate after the individual job partitions. This lets
     # consumers compare a whole run without re-aggregating its job rows.
-    for uuid, uuid_data in sorted(uuid_partitions.items()):
+    for (uuid, metric_name), uuid_data in sorted(uuid_partitions.items()):
         stats = compute_stats([float(entry['value']) for entry in uuid_data])
         metadata = _shared_job_summary_csv_values(job_summaries, uuid)
         _append_csv_stats_row(
             csv_rows,
-            {**metadata, 'uuid': uuid, 'job_name': ALL_JOBS_VALUE},
+            {
+                **metadata,
+                'uuid': uuid,
+                'metric_name': metric_name,
+                'job_name': ALL_JOBS_VALUE,
+            },
             ALL_LABELS_KEY,
             ALL_LABELS_VALUE,
             stats,

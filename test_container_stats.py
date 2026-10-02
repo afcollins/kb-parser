@@ -15,6 +15,19 @@ MULTI_JOB_UUID = 'b334187f-b4e4-4e80-ab20-63a937fa7aea'
 
 
 class TestUuidWideAggregation:
+    def test_metric_name_partitions_are_not_merged(self):
+        records = [
+            {'uuid': 'run-1', 'metricName': 'containerCPU', 'jobName': 'rds'},
+            {'uuid': 'run-1', 'metricName': 'containerMemory', 'jobName': 'rds'},
+        ]
+
+        partitions = CS._metric_partitions(records)
+
+        assert set(partitions) == {
+            ('run-1', 'containerCPU', 'rds'),
+            ('run-1', 'containerMemory', 'rds'),
+        }
+
     def test_job_summary_metadata_columns_are_mapped(self):
         summary = {
             'clusterName': 'test-cluster',
@@ -95,6 +108,7 @@ class TestUuidWideAggregation:
 
         assert rows
         assert {row['uuid'] for row in rows} == {MULTI_JOB_UUID}
+        assert {row['metric_name'] for row in rows} == {'kubeletCPU'}
         assert {row['workload'] for row in rows} == {'rds'}
         assert {
             row['job_name'] for row in rows
